@@ -36,7 +36,7 @@ concurrency:
 
 jobs:
   check:
-    if: github.event_name != 'release' || github.event.release.author.login != 'github-actions[bot]'
+    if: github.event_name != 'release'
     runs-on: ubuntu-24.04
     outputs:
       build: ${{ steps.plan.outputs.build }}
@@ -183,7 +183,13 @@ jobs:
     if: always() && needs.check.outputs.build == 'true' && needs.build.result != 'cancelled'
     runs-on: ubuntu-24.04
     env:
-      GH_TOKEN: ${{ github.token }}
+      # orca cloud only takes a publish from a run that a release event started, and a
+      # release made with the workflow's own token doesnt fire one. so the release is made
+      # with RELEASE_TOKEN (a token of yours with contents: write on this repo), which
+      # fires the release event and the republish job below does the hub upload. with no
+      # secret it makes a draft instead, and pressing publish on it does the same.
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+      HAVE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
       VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
@@ -213,17 +219,12 @@ jobs:
           notes="$notes
 
           build-key: ${{ needs.check.outputs.key }}"
-          gh release create "v$VERSION" dist/*.whl --title "$VERSION" --notes "$notes" --target "$GITHUB_SHA"
-          echo "$notes" > release_notes.txt
-
-      - name: publish to orca cloud
-        run: |
-          set -euo pipefail
-          publish() { bash .github/publish.sh "$1" "$2" dist/*.whl; }
-          publish "$VERSION" "$(head -c 4000 release_notes.txt | sed '/^build-key:/d')"
+          draft=""
+          [ "$HAVE_TOKEN" = "true" ] || { draft="--draft"; echo "::warning::no RELEASE_TOKEN secret, made a draft. press publish on it to send it to orca cloud"; }
+          gh release create "v$VERSION" dist/*.whl --title "$VERSION" --notes "$notes" --target "$GITHUB_SHA" $draft
 
   republish:
-    if: github.event_name == 'release' && github.event.release.author.login != 'github-actions[bot]'
+    if: github.event_name == 'release'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
