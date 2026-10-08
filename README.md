@@ -28,10 +28,33 @@ Requirements:
 
 ## Install
 
-One file: `bambu_multi_account_any.py`. Subscribe to it on the Orca Cloud
-plugin hub, or use Plugins > **Install local plugin** and pick the file.
+subscribe to it on the orca cloud plugin hub. keep persano's open bambu
+networking plugin installed too, this sits on top of it.
 
-The first login asks for permission to make HTTP requests to
+the multi account bit needs a change in the networking library that
+persano hasnt merged yet ([PR #2](https://github.com/persano/open-bamboo-networking/pull/2)),
+so the hub version of this plugin comes with its own build of his library:
+his latest code plus the multi account patch, for windows, linux and mac.
+first time you open the tab it says "turn on multi account" with an install
+button. that backs up the library you have, puts the multi account one in,
+and you restart orca. theres a "put the original back" link if you want to
+go back.
+
+it only offers the install if its build is at least as new as your open
+bambu networking, so it never rolls back one of his fixes. the builds come
+from github actions in [bambu-multi-account](https://github.com/RubberDingyRapids/bambu-multi-account),
+which checks his repo every day and makes a new build when he changes
+something. if he updates and the build hasnt caught up yet, the tab tells
+you and waits.
+
+if you hit install/update in his open bambu tab, his library goes back in
+and multi account switches off. just open this tab and install again.
+
+for a local install (`bambu_multi_account_any.py` on its own) theres no
+bundled library, so you need a library with multi account in some other
+way, like the `obn combined build` folder in this repo.
+
+the first login asks for permission to make HTTP requests to
 `api.bambulab.com`.
 
 ## How it works

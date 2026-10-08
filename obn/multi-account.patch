@@ -1,0 +1,1030 @@
+From b0181d4cb5ded568e39b4ea711f3c644be14edf1 Mon Sep 17 00:00:00 2001
+From: RubberDingyRapids <smellthellama@gmail.com>
+Date: Wed, 7 Oct 2026 20:00:55 +0100
+Subject: [PATCH] cloud: run extra Bambu accounts next to the logged-in one
+
+The slicer only knows one account. A companion Orca plugin can now list
+more in <config_dir>/obn.accounts.json (obn.auth.json's keys plus
+enabled/label); the library only reads it.
+
+- One CloudSession per enabled extra account, started with the primary
+  connection and stopped with it. They share connect_cloud's report and
+  subscribe-failure handlers.
+- get_user_print_info appends each extra account's printers (optionally
+  as "[label] name"), records dev_id -> owning account, and skips
+  printers an earlier account already listed.
+- Subscribe, publish, pushall kickstart, cloud print, the /user/ttcode
+  camera mint, firmware lookup, rename and unbind use the owner's
+  connection/token.
+- Errors from an extra account's printers are not passed to
+  on_http_error, so a 401 there cannot log the slicer out.
+- New exports obn_extra_accounts_api / _reload / _status for the plugin.
+  Reload re-reads the file, restarts the extra sessions and asks the
+  slicer to refetch its device list via the user-topic bind notice,
+  naming the already-selected printer so the selection is unchanged.
+
+Without obn.accounts.json nothing changes.
+---
+ CMakeLists.txt                 |  15 +++
+ include/obn/agent.hpp          |  42 ++++++
+ include/obn/auth.hpp           |   6 +
+ include/obn/extra_accounts.hpp |  41 ++++++
+ src/abi_http.cpp               |  62 +++++++--
+ src/agent.cpp                  |  73 +++++++----
+ src/agent_accounts.cpp         | 226 +++++++++++++++++++++++++++++++++
+ src/auth.cpp                   |  29 +++--
+ src/bind_cloud.cpp             |  12 +-
+ src/cloud_print.cpp            |   4 +-
+ src/extra_accounts.cpp         |  53 ++++++++
+ tests/extra_accounts_test.cpp  |  83 ++++++++++++
+ 12 files changed, 593 insertions(+), 53 deletions(-)
+ create mode 100644 include/obn/extra_accounts.hpp
+ create mode 100644 src/agent_accounts.cpp
+ create mode 100644 src/extra_accounts.cpp
+ create mode 100644 tests/extra_accounts_test.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 76d344a..82253d9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -377,6 +377,8 @@ add_library(bambu_networking SHARED
+     src/abi_track.cpp
+     src/abi_ft.cpp
+     src/agent.cpp
++    src/agent_accounts.cpp
++    src/extra_accounts.cpp
+     src/auth.cpp
+     src/camera_probe.cpp
+     src/camera_url.cpp
+@@ -1080,8 +1082,19 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
+     target_include_directories(auth_persist_test PRIVATE include)
+     add_test(NAME auth_persist COMMAND auth_persist_test)
+ 
++    add_executable(extra_accounts_test tests/extra_accounts_test.cpp
++        src/auth.cpp
++        src/extra_accounts.cpp
++        src/json_lite.cpp
++        src/log.cpp
++        src/os_compat.cpp)
++    target_include_directories(extra_accounts_test PRIVATE include)
++    add_test(NAME extra_accounts COMMAND extra_accounts_test)
++
+     add_executable(lan_live_test tests/lan_live_test.cpp
+         src/agent.cpp
++        src/agent_accounts.cpp
++        src/extra_accounts.cpp
+         src/appcert_cipher.cpp
+         src/appcert_fetch.cpp
+         src/auth.cpp
+@@ -1165,6 +1178,8 @@ if(OBN_BUILD_TESTS AND NOT WIN32)
+     # whole core has to be linked in.
+     set(OBN_TEST_CORE_SOURCES
+         src/agent.cpp
++        src/agent_accounts.cpp
++        src/extra_accounts.cpp
+         src/appcert_cipher.cpp
+         src/appcert_fetch.cpp
+         src/auth.cpp
+diff --git a/include/obn/agent.hpp b/include/obn/agent.hpp
+index b8622b0..02eddb9 100644
+--- a/include/obn/agent.hpp
++++ b/include/obn/agent.hpp
+@@ -14,6 +14,7 @@
+ #include <vector>
+ 
+ #include "obn/auth.hpp"
++#include "obn/extra_accounts.hpp"
+ #include "obn/state.hpp"
+ #include "obn/bambu_networking.hpp"
+ #include "obn/mqtt_client.hpp"
+@@ -466,6 +467,25 @@ public:
+     // Studio's load_user_preset().
+     std::string cloud_user_id() const;
+ 
++    // ------------------------------------------------------------------
++    // Extra cloud accounts (obn.accounts.json, see extra_accounts.hpp).
++    // ------------------------------------------------------------------
++    // Re-reads the file, restarts the extra sessions and asks the slicer to
++    // fetch its device list again. Returns the number of enabled accounts.
++    int reload_extra_accounts();
++    // Enabled extra accounts (never the primary uid).
++    std::vector<obn::accounts::ExtraAccount> extra_accounts() const;
++    // dev_id -> extra-account uid, set by get_user_print_info after a merge.
++    // Devices not in the map belong to the primary account.
++    void set_extra_device_owners(std::map<std::string, std::string> owners);
++    // Session of the account that owns dev_id, else the primary session.
++    obn::auth::Session session_for_device(const std::string& dev_id) const;
++    // cloud_api_http_headers() with the owner's Bearer.
++    std::map<std::string, std::string>
++        cloud_api_http_headers_for(const std::string& dev_id) const;
++    // {"api":1,"accounts":[{"user_id","started","connected"}...]}.
++    std::string extra_accounts_status_json() const;
++
+ private:
+     // Scans an incoming MQTT report frame (LAN or cloud) for a
+     // security.app_cert_install success response and installs the returned
+@@ -584,6 +604,28 @@ private:
+     void shutdown_lan_session();
+     std::shared_ptr<ssdp::Discovery> discovery_;
+     std::shared_ptr<CloudSession>   cloud_session_;
++    // Extra accounts by user_id. `session` is null until the primary
++    // connection is up and for disabled entries; same take-out-then-stop()
++    // rule as cloud_session_.
++    struct ExtraCloud {
++        obn::accounts::ExtraAccount   account;
++        std::shared_ptr<CloudSession> session;
++    };
++    std::map<std::string, ExtraCloud>  extra_clouds_;
++    std::map<std::string, std::string> extra_dev_owner_;   // dev_id -> user_id
++    // connect_cloud's report / subscribe-failure handlers, shared by the
++    // extra sessions.
++    std::function<void(std::string, std::string)> cloud_msg_cb_;
++    std::function<void(std::string)>              cloud_sub_fail_cb_;
++    // Reads obn.accounts.json into extra_clouds_; returns the previous
++    // sessions for the caller to stop() outside mu_.
++    std::vector<std::shared_ptr<CloudSession>> load_extra_accounts_();
++    // Starts a session for every enabled extra account without one.
++    void start_extra_sessions_();
++    // Session a publish/subscribe for dev_id goes through. Caller holds mu_.
++    std::shared_ptr<CloudSession> cloud_session_for_locked_(const std::string& dev_id) const;
++    // Makes the slicer re-run get_user_print_info (see agent_accounts.cpp).
++    void request_device_list_refresh_();
+     // Lazy localhost HTTP server that hands cover PNGs to Studio's
+     // wxWebRequest. Only spun up when we first mint a synthetic
+     // subtask id; destructor joins its accept loop.
+diff --git a/include/obn/auth.hpp b/include/obn/auth.hpp
+index 1a67b1b..d8d9baa 100644
+--- a/include/obn/auth.hpp
++++ b/include/obn/auth.hpp
+@@ -18,6 +18,8 @@
+ #include <optional>
+ #include <string>
+ 
++namespace obn::json { class Value; }
++
+ namespace obn::auth {
+ 
+ struct Session {
+@@ -36,6 +38,10 @@ struct Session {
+     bool logged_in() const { return !access_token.empty() && !user_id.empty(); }
+ };
+ 
++// Reads one session object in the obn.auth.json layout. obn.accounts.json
++// entries use the same keys (see extra_accounts.hpp).
++Session session_from_json(const obn::json::Value& obj);
++
+ class Store {
+ public:
+     // `path` is usually `<config_dir>/obn.auth.json`. Empty path disables
+diff --git a/include/obn/extra_accounts.hpp b/include/obn/extra_accounts.hpp
+new file mode 100644
+index 0000000..f6c6f91
+--- /dev/null
++++ b/include/obn/extra_accounts.hpp
+@@ -0,0 +1,41 @@
++#pragma once
++
++// Extra Bambu Cloud accounts that run next to the logged-in one.
++//
++// A companion Orca plugin lists them in `<config_dir>/obn.accounts.json`
++// and owns that file (login, token refresh); the library only reads it and
++// re-reads it on obn_extra_accounts_reload(). Entries use obn.auth.json's
++// keys plus `enabled` and `label`:
++//
++//   {"version":1,"accounts":[{"enabled":true,"label":"Work",
++//     "account":"me@work.example","access_token":"...","refresh_token":"...",
++//     "expires_at":"2027-01-01T00:00:00Z","user_id":"123","user_name":"..."}]}
++//
++// All accounts share the slicer's cloud region. See agent_accounts.cpp for
++// how the agent uses them.
++
++#include "obn/auth.hpp"
++
++#include <string>
++#include <vector>
++
++namespace obn::accounts {
++
++struct ExtraAccount {
++    obn::auth::Session session;
++    std::string        label;          // put in front of printer names; may be empty
++    bool               enabled = true;
++};
++
++// Parses the file body. Entries without user_id or access_token are skipped,
++// as are repeats of a user_id. On a parse error returns an empty list and
++// fills `err`.
++std::vector<ExtraAccount> parse(const std::string& text, std::string* err = nullptr);
++
++// Reads and parses `path`. A missing file is not an error: empty list.
++std::vector<ExtraAccount> load(const std::string& path, std::string* err = nullptr);
++
++// "[label] name", or `name` unchanged when the label is empty.
++std::string labelled_name(const std::string& label, const std::string& name);
++
++} // namespace obn::accounts
+diff --git a/src/abi_http.cpp b/src/abi_http.cpp
+index 94addb1..c977e96 100644
+--- a/src/abi_http.cpp
++++ b/src/abi_http.cpp
+@@ -1,4 +1,5 @@
+ #include <map>
++#include <set>
+ #include <sstream>
+ #include <string>
+ #include <vector>
+@@ -10,6 +11,7 @@
+ #include "obn/cloud_auth.hpp"
+ #include "obn/config.hpp"
+ #include "obn/device_region.hpp"
++#include "obn/extra_accounts.hpp"
+ #include "obn/http_client.hpp"
+ #include "obn/json_lite.hpp"
+ #include "obn/log.hpp"
+@@ -99,20 +101,26 @@ std::string dump_or_null(const obn::json::Value& v)
+ //
+ // Security note: dev_access_code is the LAN MQTT password (also shown
+ // on the printer display). It is returned in plaintext from this endpoint.
++//
++// Returns the device entries without the envelope; the caller wraps them so
++// extra accounts' printers (extra_accounts.hpp) can be appended first. For
++// those, `name_label` goes in front of each dev_name and `skip_ids` drops
++// printers an earlier account already listed.
+ std::string remap_bind_payload(
+     const std::string& raw_body,
+     std::vector<std::string>* out_dev_ids,
+-    std::vector<std::pair<std::string, std::string>>* out_access_codes)
++    std::vector<std::pair<std::string, std::string>>* out_access_codes,
++    const std::string& name_label = {},
++    const std::set<std::string>* skip_ids = nullptr)
+ {
+     std::string perr;
+     auto root = obn::json::parse(raw_body, &perr);
+     if (!root) {
+         OBN_WARN("get_user_print_info: bad JSON from server: %s", perr.c_str());
+-        return R"({"devices":[]})";
++        return {};
+     }
+ 
+     std::ostringstream out;
+-    out << "{\"message\":\"success\",\"devices\":[";
+     // Copy the devices array out of the temporary Value to avoid
+     // dangling reference (as_array() returns a reference to storage
+     // owned by the temporary returned from find()).
+@@ -120,17 +128,18 @@ std::string remap_bind_payload(
+     const auto& devs = devs_v.as_array();
+     bool first = true;
+     for (const auto& d : devs) {
++        // Required by Studio's parser.
++        const auto dev_id = d.find("dev_id").as_string();
++        if (skip_ids && skip_ids->count(dev_id)) continue;
+         if (!first) out << ',';
+         first = false;
+         out << '{';
+-        // Required by Studio's parser.
+-        const auto dev_id = d.find("dev_id").as_string();
+         if (out_dev_ids && !dev_id.empty()) out_dev_ids->push_back(dev_id);
+         out << "\"dev_id\":"          << obn::json::escape(dev_id) << ',';
+         {
+             auto dn = d.find("dev_name");
+-            out << "\"dev_name\":" << obn::json::escape(
+-                !dn.is_null() ? dn.as_string() : d.find("name").as_string()) << ',';
++            out << "\"dev_name\":" << obn::json::escape(obn::accounts::labelled_name(
++                name_label, !dn.is_null() ? dn.as_string() : d.find("name").as_string())) << ',';
+         }
+         {
+             auto on = d.find("dev_online");
+@@ -160,7 +169,6 @@ std::string remap_bind_payload(
+             out << ",\"dev_structure\":" << obn::json::escape(v.as_string());
+         out << '}';
+     }
+-    out << "]}";
+     return out.str();
+ }
+ 
+@@ -182,7 +190,9 @@ bool fetch_user_print_info(obn::Agent* a,
+                            const std::string& path,
+                            obn::http::Response* out_resp,
+                            std::string* out_mapped,
+-                           std::vector<std::string>* out_dev_ids)
++                           std::vector<std::string>* out_dev_ids,
++                           const std::string& name_label = {},
++                           const std::set<std::string>* skip_ids = nullptr)
+ {
+     const std::string url = obn::cloud::api_host(a->cloud_region()) + path;
+     std::map<std::string, std::string> hdrs{
+@@ -194,7 +204,7 @@ bool fetch_user_print_info(obn::Agent* a,
+ 
+     std::vector<std::pair<std::string, std::string>> access_codes;
+     std::string mapped = remap_bind_payload(resp.body, out_dev_ids,
+-                                            &access_codes);
++                                            &access_codes, name_label, skip_ids);
+     if (count_devices(resp.body) == 0) return false;
+ 
+     // Remember the LAN access code per device so camera_url_for() can mint
+@@ -251,8 +261,36 @@ OBN_ABI int bambu_network_get_user_print_info(void* agent,
+     }
+     if (!ok) {
+         OBN_WARN("get_user_print_info: both endpoints returned no devices");
+-        mapped = R"({"message":"success","devices":[]})";
++        mapped.clear();
++    }
++
++    // Extra accounts (extra_accounts.hpp): append their printers and remember
++    // which account owns each, so MQTT, printing and the camera use that
++    // account. A printer already listed keeps its first owner.
++    std::map<std::string, std::string> owners;
++    std::set<std::string> listed(dev_ids.begin(), dev_ids.end());
++    for (const auto& acct : a->extra_accounts()) {
++        const std::string& uid = acct.session.user_id;
++        obn::http::Response xresp;
++        std::string xmapped;
++        std::vector<std::string> xids;
++        if (!fetch_user_print_info(a, acct.session, print_path, &xresp, &xmapped, &xids, acct.label, &listed) &&
++            !fetch_user_print_info(a, acct.session, bind_path, &xresp, &xmapped, &xids, acct.label, &listed)) {
++            OBN_WARN("get_user_print_info: extra account uid=%s: no devices (HTTP %ld %s)",
++                     uid.c_str(), xresp.status_code, xresp.error.c_str());
++            continue;
++        }
++        if (!mapped.empty() && !xmapped.empty()) mapped += ',';
++        mapped += xmapped;
++        for (const auto& id : xids) {
++            owners[id] = uid;
++            listed.insert(id);
++            dev_ids.push_back(id);
++        }
++        OBN_INFO("get_user_print_info: extra account uid=%s added %zu device(s)", uid.c_str(), xids.size());
+     }
++    a->set_extra_device_owners(std::move(owners));
++    mapped = "{\"message\":\"success\",\"devices\":[" + mapped + "]}";
+ 
+     OBN_INFO("get_user_print_info: mapped %zu -> %zu bytes, %zu device(s)",
+              resp.body.size(), mapped.size(), dev_ids.size());
+@@ -399,7 +437,7 @@ OBN_ABI int bambu_network_get_printer_firmware(void* agent,
+         body = a->render_firmware_json(dev_id);
+ 
+         if (!a->has_firmware_data(dev_id)) {
+-            auto s = a->user_session_snapshot();
++            auto s = a->session_for_device(dev_id);
+             if (!s.access_token.empty() && !s.user_id.empty()) {
+                 const std::string url = obn::cloud::api_host(a->cloud_region())
+                     + "/v1/iot-service/api/user/device/version?dev_id=" + dev_id;
+diff --git a/src/agent.cpp b/src/agent.cpp
+index 00afe01..13947e0 100644
+--- a/src/agent.cpp
++++ b/src/agent.cpp
+@@ -144,6 +144,8 @@ Agent::~Agent()
+     if (lan_watchdog_thread_.joinable()) lan_watchdog_thread_.join();
+     if (discovery_) discovery_->stop();
+     if (cloud_session_) cloud_session_->stop();
++    for (auto& [uid, extra] : extra_clouds_)
++        if (extra.session) extra.session->stop();
+ }
+ 
+ void Agent::schedule_deferred_disconnect()
+@@ -1768,7 +1770,9 @@ std::string Agent::remote_camera_url(const std::string& dev_id)
+         return {};
+     }
+ 
+-    const auto session = user_session_snapshot();
++    // Minted by the account that owns the printer (extra_accounts.hpp).
++    const auto session =
++        session_for_device(obn::camera::parse_packed_dev_key(dev_id).serial);
+     if (session.access_token.empty()) {
+         OBN_WARN("camera_url(remote): no cloud token for dev=%s", dev_id.c_str());
+         return {};
+@@ -2369,6 +2373,7 @@ void Agent::set_config_dir(std::string dir)
+             obn::config::path_in_dir("obn.auth.json"));
+         auth_store_->load();
+         hydrate_session();
++        for (auto& stale : load_extra_accounts_()) stale->stop();
+ 
+         const std::string state_path =
+             obn::config::path_in_dir("obn.state.json");
+@@ -3267,17 +3272,29 @@ int Agent::connect_cloud()
+         }
+     };
+ 
+-    return session->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
++    {
++        // Extra accounts' sessions share the report and subscribe-failure
++        // handlers (agent_accounts.cpp).
++        std::lock_guard<std::mutex> lk(mu_);
++        cloud_msg_cb_      = on_msg_cb;
++        cloud_sub_fail_cb_ = on_sub_fail_cb;
++    }
++    int rc = session->start(on_connected_cb, on_msg_cb, on_sub_fail_cb);
++    if (rc == BAMBU_NETWORK_SUCCESS) start_extra_sessions_();
++    return rc;
+ }
+ 
+ int Agent::disconnect_cloud()
+ {
+     std::shared_ptr<CloudSession> sess;
++    std::vector<std::shared_ptr<CloudSession>> extras;
+     std::set<std::string>         devs;
+     std::string                   lan_dev;
+     {
+         std::lock_guard<std::mutex> lk(mu_);
+         sess = std::move(cloud_session_);
++        for (auto& [uid, extra] : extra_clouds_)
++            if (extra.session) extras.push_back(std::move(extra.session));
+         devs.swap(cloud_connected_devs_);
+         cloud_notified_devs_.clear();
+         cloud_kickstarted_devs_.clear();
+@@ -3291,6 +3308,7 @@ int Agent::disconnect_cloud()
+         }
+     }
+     if (sess) sess->stop();
++    for (auto& e : extras) e->stop();
+     // Release cached RSA pubkeys learned during this cloud session.
+     for (const auto& d : devs) cert_store::forget_printer(d);
+     return BAMBU_NETWORK_SUCCESS;
+@@ -3329,23 +3347,24 @@ int Agent::cloud_refresh()
+ 
+ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
+ {
+-    std::shared_ptr<CloudSession> sess;
+-    std::vector<std::string> filtered;
++    // Grouped by the connection that owns each device (agent_accounts.cpp).
++    // Do not skip devices under LAN priority: cloud subscription
++    // is required for Option B cloud print rescue (84033543 interception).
++    std::map<std::shared_ptr<CloudSession>, std::vector<std::string>> by_session;
+     {
+         std::lock_guard<std::mutex> lk(mu_);
+-        sess = cloud_session_;
+-        // Do not skip devices under LAN priority: cloud subscription
+-        // is required for Option B cloud print rescue (84033543 interception).
+-        for (const auto& d : dev_ids) {
+-            filtered.push_back(d);
+-        }
++        for (const auto& d : dev_ids) by_session[cloud_session_for_locked_(d)].push_back(d);
+     }
+-    if (!sess) {
+-        OBN_WARN("cloud_add_subscribe: no active cloud session");
+-        return BAMBU_NETWORK_ERR_INVALID_HANDLE;
++    if (dev_ids.empty()) return BAMBU_NETWORK_SUCCESS;
++    int rc = BAMBU_NETWORK_SUCCESS;
++    for (const auto& [sess, devs] : by_session) {
++        if (!sess) {
++            OBN_WARN("cloud_add_subscribe: no active cloud session for %s", devs.front().c_str());
++            rc = BAMBU_NETWORK_ERR_INVALID_HANDLE;
++        } else if (int r = sess->add_subscribe(devs); r != BAMBU_NETWORK_SUCCESS) {
++            rc = r;
++        }
+     }
+-    if (filtered.empty()) return BAMBU_NETWORK_SUCCESS;
+-    int rc = sess->add_subscribe(filtered);
+     // Covers the other ordering: Studio subscribes on an already-connected
+     // session (device list refresh, LAN failback, multi-device page). When it
+     // subscribes before CONNACK instead, add_subscribe only records the set and
+@@ -3356,19 +3375,21 @@ int Agent::cloud_add_subscribe(const std::vector<std::string>& dev_ids)
+ 
+ int Agent::cloud_del_subscribe(const std::vector<std::string>& dev_ids)
+ {
+-    std::shared_ptr<CloudSession> sess;
++    std::map<std::shared_ptr<CloudSession>, std::vector<std::string>> by_session;
+     {
+         std::lock_guard<std::mutex> lk(mu_);
+-        sess = cloud_session_;
+         for (const auto& d : dev_ids) {
++            by_session[cloud_session_for_locked_(d)].push_back(d);
+             cloud_connected_devs_.erase(d);
+             cloud_notified_devs_.erase(d);
+             cloud_kickstarted_devs_.erase(d);
+             app_cert_install_sent_.erase(d);
+         }
+     }
+-    if (!sess) return BAMBU_NETWORK_SUCCESS;
+-    return sess->del_subscribe(dev_ids);
++    int rc = BAMBU_NETWORK_SUCCESS;
++    for (const auto& [sess, devs] : by_session)
++        if (sess) if (int r = sess->del_subscribe(devs); r != BAMBU_NETWORK_SUCCESS) rc = r;
++    return rc;
+ }
+ 
+ // Stock kickstart shape (research/06.02 + research/12.01): constant
+@@ -3381,18 +3402,20 @@ void Agent::kickstart_cloud_status()
+ {
+     if (!obn::config::current().cloud_pushall_on_connect) return;
+ 
+-    std::shared_ptr<CloudSession> sess;
++    std::vector<std::shared_ptr<CloudSession>> sessions;
+     {
+         std::lock_guard<std::mutex> lk(mu_);
+-        sess = cloud_session_;
++        sessions.push_back(cloud_session_);
++        for (const auto& [uid, extra] : extra_clouds_) sessions.push_back(extra.session);
+     }
+     // Only bootstrap devices whose report subscription is already live: a
+     // reply to a topic nobody listens on is lost, which is exactly the trap
+     // of publishing straight after add_subscribe (that runs before CONNACK).
+-    if (!sess || !sess->is_connected()) return;
+-
+     // Queried before taking mu_ so the two mutexes are never nested.
+-    const std::vector<std::string> active = sess->active_devices();
++    std::vector<std::string> active;
++    for (const auto& sess : sessions)
++        if (sess && sess->is_connected())
++            for (auto& d : sess->active_devices()) active.push_back(std::move(d));
+     std::vector<std::string>       pending;
+     {
+         std::lock_guard<std::mutex> lk(mu_);
+@@ -3422,7 +3445,7 @@ int Agent::cloud_send_message(const std::string& dev_id,
+     std::shared_ptr<CloudSession> sess;
+     {
+         std::lock_guard<std::mutex> lk(mu_);
+-        sess = cloud_session_;
++        sess = cloud_session_for_locked_(dev_id);
+     }
+     if (!sess) {
+         OBN_WARN("cloud_send_message: no active cloud session for %s",
+diff --git a/src/agent_accounts.cpp b/src/agent_accounts.cpp
+new file mode 100644
+index 0000000..97c9355
+--- /dev/null
++++ b/src/agent_accounts.cpp
+@@ -0,0 +1,226 @@
++// Extra cloud accounts: one CloudSession per account in obn.accounts.json,
++// next to the primary session the slicer logged in. See extra_accounts.hpp.
++//
++// The slicer still sees one account. get_user_print_info (abi_http.cpp)
++// appends the extra accounts' printers to the primary's list and records
++// which account each came from in extra_dev_owner_; publish, subscribe,
++// cloud print, camera and rename/unbind then pick the owner's connection
++// and token through cloud_session_for_locked_() / session_for_device().
++
++#include "obn/agent.hpp"
++
++#include "obn/abi_export.hpp"
++#include "obn/bambu_networking.hpp"
++#include "obn/cloud_ca_bundle.hpp"
++#include "obn/cloud_session.hpp"
++#include "obn/config.hpp"
++#include "obn/json_lite.hpp"
++#include "obn/log.hpp"
++
++namespace obn {
++
++std::vector<std::shared_ptr<CloudSession>> Agent::load_extra_accounts_()
++{
++    const std::string path = obn::config::path_in_dir("obn.accounts.json");
++    std::string err;
++    auto list = obn::accounts::load(path, &err);
++    if (!err.empty()) {
++        OBN_WARN("accounts: %s is not valid JSON (%s); keeping the current set",
++                 path.c_str(), err.c_str());
++        return {};
++    }
++    const std::string primary = cloud_user_id();
++
++    // Every reload starts over: the old sessions go back to the caller to
++    // stop, start_extra_sessions_ opens fresh ones. Reloads are rare (the
++    // plugin adds, removes or refreshes an account), so a reconnect is fine.
++    std::vector<std::shared_ptr<CloudSession>> old;
++    std::lock_guard<std::mutex> lk(mu_);
++    for (auto& [uid, ec] : extra_clouds_)
++        if (ec.session) old.push_back(std::move(ec.session));
++    extra_clouds_.clear();
++    for (auto& a : list) {
++        if (a.session.user_id == primary) continue;
++        const std::string uid = a.session.user_id;   // read before the move
++        extra_clouds_[uid] = {std::move(a), nullptr};
++    }
++    // Fresh sessions must bootstrap their printers again.
++    for (const auto& [dev, uid] : extra_dev_owner_) cloud_kickstarted_devs_.erase(dev);
++    OBN_INFO("accounts: %zu extra account(s) in %s", extra_clouds_.size(), path.c_str());
++    return old;
++}
++
++void Agent::start_extra_sessions_()
++{
++    if (obn::config::current().block_cloud) return;
++    const std::string region = cloud_region();
++    std::string ca;
++#if defined(_WIN32)
++    ca = obn::tls::ensure_cloud_ca_bundle_file(config_dir());
++#endif
++
++    std::vector<std::pair<std::string, std::shared_ptr<CloudSession>>> fresh;
++    std::map<std::string, std::vector<std::string>> devs_by_uid;
++    std::function<void(std::string, std::string)> on_msg;
++    std::function<void(std::string)>              on_sub_fail;
++    {
++        std::lock_guard<std::mutex> lk(mu_);
++        // Extra accounts only run alongside the primary connection, so they
++        // come and go with the slicer's own login.
++        if (!cloud_session_ || !cloud_session_->is_started() || !cloud_msg_cb_) return;
++        on_msg      = cloud_msg_cb_;
++        on_sub_fail = cloud_sub_fail_cb_;
++        for (auto& [uid, ec] : extra_clouds_) {
++            if (!ec.account.enabled || ec.session) continue;
++            ec.session = std::make_shared<CloudSession>();
++            ec.session->configure(region, uid, ec.account.session.access_token, ca);
++            fresh.emplace_back(uid, ec.session);
++        }
++        for (const auto& [dev, uid] : extra_dev_owner_) devs_by_uid[uid].push_back(dev);
++    }
++
++    for (auto& [uid, sess] : fresh) {
++        auto on_connected = [this, uid = uid](int status, int reason, std::string /*msg*/) {
++            OBN_INFO("cloud: extra account uid=%s status=%d reason=%d", uid.c_str(), status, reason);
++            // The slicer's "server connected" state tracks the primary only.
++            if (status == 0) { kickstart_cloud_status(); return; }
++            std::lock_guard<std::mutex> lk(mu_);
++            for (const auto& [dev, owner] : extra_dev_owner_)
++                if (owner == uid) cloud_kickstarted_devs_.erase(dev);
++        };
++        if (int rc = sess->start(on_connected, on_msg, on_sub_fail); rc != BAMBU_NETWORK_SUCCESS) {
++            OBN_WARN("cloud: extra account uid=%s failed to start rc=%d", uid.c_str(), rc);
++            std::lock_guard<std::mutex> lk(mu_);
++            if (auto it = extra_clouds_.find(uid); it != extra_clouds_.end() && it->second.session == sess)
++                it->second.session.reset();
++            continue;
++        }
++        OBN_INFO("cloud: extra account uid=%s connecting", uid.c_str());
++        if (auto it = devs_by_uid.find(uid); it != devs_by_uid.end()) sess->add_subscribe(it->second);
++    }
++}
++
++std::shared_ptr<CloudSession> Agent::cloud_session_for_locked_(const std::string& dev_id) const
++{
++    auto owner = extra_dev_owner_.find(dev_id);
++    if (owner == extra_dev_owner_.end()) return cloud_session_;
++    auto ec = extra_clouds_.find(owner->second);
++    // Never fall back to the primary: the broker refuses another account's
++    // device topics, and a refused subscribe drops the whole connection.
++    return ec != extra_clouds_.end() ? ec->second.session : nullptr;
++}
++
++int Agent::reload_extra_accounts()
++{
++    if (config_dir().empty()) return BAMBU_NETWORK_ERR_INVALID_HANDLE;
++    for (auto& old : load_extra_accounts_()) old->stop();
++    start_extra_sessions_();
++    request_device_list_refresh_();
++    return static_cast<int>(extra_accounts().size());
++}
++
++std::vector<obn::accounts::ExtraAccount> Agent::extra_accounts() const
++{
++    std::vector<obn::accounts::ExtraAccount> out;
++    std::lock_guard<std::mutex> lk(mu_);
++    for (const auto& [uid, ec] : extra_clouds_)
++        if (ec.account.enabled) out.push_back(ec.account);
++    return out;
++}
++
++void Agent::set_extra_device_owners(std::map<std::string, std::string> owners)
++{
++    std::lock_guard<std::mutex> lk(mu_);
++    extra_dev_owner_.swap(owners);
++}
++
++obn::auth::Session Agent::session_for_device(const std::string& dev_id) const
++{
++    {
++        std::lock_guard<std::mutex> lk(mu_);
++        if (auto owner = extra_dev_owner_.find(dev_id); owner != extra_dev_owner_.end())
++            if (auto ec = extra_clouds_.find(owner->second); ec != extra_clouds_.end())
++                return ec->second.account.session;
++    }
++    return user_session_snapshot();
++}
++
++std::map<std::string, std::string>
++Agent::cloud_api_http_headers_for(const std::string& dev_id) const
++{
++    auto h = cloud_api_http_headers();
++    const auto s = session_for_device(dev_id);
++    if (!s.access_token.empty()) h["Authorization"] = "Bearer " + s.access_token;
++    return h;
++}
++
++std::string Agent::extra_accounts_status_json() const
++{
++    std::string out = "{\"api\":1,\"accounts\":[";
++    std::lock_guard<std::mutex> lk(mu_);
++    bool first = true;
++    for (const auto& [uid, ec] : extra_clouds_) {
++        if (!first) out += ',';
++        first = false;
++        out += "{\"user_id\":" + obn::json::escape(uid);
++        out += std::string(",\"started\":") + (ec.session && ec.session->is_started() ? "true" : "false");
++        out += std::string(",\"connected\":") + (ec.session && ec.session->is_connected() ? "true" : "false");
++        out += '}';
++    }
++    return out + "]}";
++}
++
++void Agent::request_device_list_refresh_()
++{
++    // Stock slicers have no "device list changed" callback. The closest is
++    // the user-topic bind notice: UserManager::parse_json answers
++    // {"bind":{"command":"bind","result":"success","dev_id":X}} with
++    // update_user_machine_list_info() and then set_selected_machine(X).
++    // Naming the printer that is already selected makes the second step a
++    // no-op. With no selection we stay quiet; the slicer picks the new list
++    // up on its next fetch (print dialog, Device tab, restart).
++    BBL::OnMessageFn fn;
++    std::string      selected;
++    {
++        std::lock_guard<std::mutex> lk(mu_);
++        fn       = on_user_message_;
++        selected = !user_selected_machine_.empty() ? user_selected_machine_ : remembered_machine_;
++    }
++    const std::string uid = cloud_user_id();
++    if (!fn || uid.empty() || selected.empty()) return;
++    OBN_INFO("accounts: asking the slicer to refetch its device list");
++    fn(uid, "{\"bind\":{\"command\":\"bind\",\"result\":\"success\",\"dev_id\":" +
++                obn::json::escape(selected) + "}}");
++}
++
++} // namespace obn
++
++// Private exports for the companion account plugin, which resolves them from
++// the already-loaded library (ctypes). Not part of Studio's ABI. The plugin
++// checks obn_extra_accounts_api() first so it can fall back to restart-based
++// switching on libraries without this feature.
++
++OBN_ABI int obn_extra_accounts_api(void)
++{
++    return 1;
++}
++
++// Re-reads obn.accounts.json and applies it. Returns the number of enabled
++// extra accounts, or a negative BAMBU_NETWORK_ERR_* when no agent is up yet.
++// Blocks while dropped connections shut down; call it off the UI thread.
++OBN_ABI int obn_extra_accounts_reload(void)
++{
++    auto* a = obn::Agent::active_instance();
++    return a ? a->reload_extra_accounts() : BAMBU_NETWORK_ERR_INVALID_HANDLE;
++}
++
++// JSON snapshot (see Agent::extra_accounts_status_json) in a thread_local
++// buffer valid until the next call on the same thread; nullptr with no agent.
++OBN_ABI const char* obn_extra_accounts_status(void)
++{
++    static thread_local std::string s_status;
++    auto* a = obn::Agent::active_instance();
++    if (!a) return nullptr;
++    s_status = a->extra_accounts_status_json();
++    return s_status.c_str();
++}
+diff --git a/src/auth.cpp b/src/auth.cpp
+index 8897a9e..7a7f30c 100644
+--- a/src/auth.cpp
++++ b/src/auth.cpp
+@@ -87,6 +87,23 @@ bool precreate_private_file(const std::string& path)
+ 
+ } // namespace
+ 
++Session session_from_json(const obn::json::Value& obj)
++{
++    Session s;
++    s.region        = obj.find("region").as_string();
++    if (s.region.empty()) s.region = "GLOBAL";
++    s.account       = obj.find("account").as_string();
++    s.access_token  = obj.find("access_token").as_string();
++    s.refresh_token = obj.find("refresh_token").as_string();
++    s.expires_at    = parse_iso8601(obj.find("expires_at").as_string());
++    s.user_id       = obj.find("user_id").as_string();
++    s.user_name     = obj.find("user_name").as_string();
++    s.nick_name     = obj.find("nick_name").as_string();
++    s.avatar        = obj.find("avatar").as_string();
++    s.firmware_beta_open = obj.find("firmware_beta_open").as_bool();
++    return s;
++}
++
+ Store::Store(std::string path) : path_(std::move(path)) {}
+ 
+ void Store::load()
+@@ -110,17 +127,7 @@ void Store::load_locked()
+         OBN_WARN("auth: failed to parse %s: %s", path_.c_str(), err.c_str());
+         return;
+     }
+-    s_.region        = root->find("region").as_string();
+-    if (s_.region.empty()) s_.region = "GLOBAL";
+-    s_.account       = root->find("account").as_string();
+-    s_.access_token  = root->find("access_token").as_string();
+-    s_.refresh_token = root->find("refresh_token").as_string();
+-    s_.expires_at    = parse_iso8601(root->find("expires_at").as_string());
+-    s_.user_id       = root->find("user_id").as_string();
+-    s_.user_name     = root->find("user_name").as_string();
+-    s_.nick_name     = root->find("nick_name").as_string();
+-    s_.avatar        = root->find("avatar").as_string();
+-    s_.firmware_beta_open = root->find("firmware_beta_open").as_bool();
++    s_ = session_from_json(*root);
+     OBN_INFO("auth: loaded session for %s (user_id=%s, expires=%s)",
+              s_.account.c_str(), s_.user_id.c_str(),
+              to_iso8601(s_.expires_at).c_str());
+diff --git a/src/bind_cloud.cpp b/src/bind_cloud.cpp
+index fd525ae..11b6d4b 100644
+--- a/src/bind_cloud.cpp
++++ b/src/bind_cloud.cpp
+@@ -231,7 +231,10 @@ int modify_printer_name(Agent* agent, const std::string& dev_id,
+ {
+     if (!agent || !agent->user_logged_in())
+         return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
+-    auto hdrs = agent->cloud_api_http_headers();
++    // An extra account's printer (extra_accounts.hpp) is renamed with its
++    // token, and its errors are not the slicer session's errors.
++    auto hdrs = agent->cloud_api_http_headers_for(dev_id);
++    const bool mine = agent->session_for_device(dev_id).user_id == agent->cloud_user_id();
+     std::ostringstream body;
+     body << '{'
+          << "\"dev_id\":" << obn::json::escape(dev_id) << ','
+@@ -241,7 +244,7 @@ int modify_printer_name(Agent* agent, const std::string& dev_id,
+         api_base(agent) + "/v1/iot-service/api/user/device/info";
+     auto resp = http_patch(url, body.str(), hdrs);
+     OBN_INFO("modify_printer_name PATCH device/info http=%ld", resp.status_code);
+-    fire_http_error(agent, resp.status_code, resp.body);
++    if (mine) fire_http_error(agent, resp.status_code, resp.body);
+     if (!resp.error.empty()) return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
+     if (http_json_success(resp.body, resp.status_code)) return BAMBU_NETWORK_SUCCESS;
+     return BAMBU_NETWORK_ERR_MODIFY_PRINTER_NAME_FAILED;
+@@ -250,7 +253,8 @@ int modify_printer_name(Agent* agent, const std::string& dev_id,
+ int unbind_device(Agent* agent, const std::string& dev_id)
+ {
+     if (!agent || !agent->user_logged_in()) return BAMBU_NETWORK_ERR_UNBIND_FAILED;
+-    auto hdrs = agent->cloud_api_http_headers();
++    auto hdrs = agent->cloud_api_http_headers_for(dev_id);
++    const bool mine = agent->session_for_device(dev_id).user_id == agent->cloud_user_id();
+     // Stock: DELETE /v1/iot-service/api/user/bind body {"dev_id","force":false}
+     const std::string url = api_base(agent) + "/v1/iot-service/api/user/bind";
+     std::ostringstream body;
+@@ -259,7 +263,7 @@ int unbind_device(Agent* agent, const std::string& dev_id)
+          << "\"force\":false}";
+     auto resp = http_delete_json(url, body.str(), hdrs);
+     OBN_INFO("unbind DELETE /user/bind http=%ld", resp.status_code);
+-    fire_http_error(agent, resp.status_code, resp.body);
++    if (mine) fire_http_error(agent, resp.status_code, resp.body);
+     if (!resp.error.empty()) return BAMBU_NETWORK_ERR_UNBIND_FAILED;
+     if (http_json_success(resp.body, resp.status_code)) return BAMBU_NETWORK_SUCCESS;
+     return BAMBU_NETWORK_ERR_UNBIND_FAILED;
+diff --git a/src/cloud_print.cpp b/src/cloud_print.cpp
+index f90446d..00b2af8 100644
+--- a/src/cloud_print.cpp
++++ b/src/cloud_print.cpp
+@@ -856,7 +856,9 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
+         return BAMBU_NETWORK_ERR_INVALID_HANDLE;
+     }
+ 
+-    auto session = user_session_snapshot();
++    // Printers of an extra account (extra_accounts.hpp) get the project,
++    // upload and task under that account.
++    auto session = session_for_device(p.dev_id);
+     if (session.access_token.empty() || session.user_id.empty()) {
+         if (update_fn) update_fn(BBL::PrintingStageERROR,
+                                  BAMBU_NETWORK_ERR_INVALID_HANDLE,
+diff --git a/src/extra_accounts.cpp b/src/extra_accounts.cpp
+new file mode 100644
+index 0000000..d775818
+--- /dev/null
++++ b/src/extra_accounts.cpp
+@@ -0,0 +1,53 @@
++#include "obn/extra_accounts.hpp"
++
++#include "obn/json_lite.hpp"
++
++#include <fstream>
++#include <iterator>
++#include <set>
++
++namespace obn::accounts {
++
++std::vector<ExtraAccount> parse(const std::string& text, std::string* err)
++{
++    std::vector<ExtraAccount> out;
++    if (text.empty()) return out;
++    std::string perr;
++    auto root = obn::json::parse(text, &perr);
++    if (!root) {
++        if (err) *err = perr;
++        return out;
++    }
++    std::set<std::string> seen;
++    auto list_v = root->find("accounts");
++    for (const auto& entry : list_v.as_array()) {
++        if (!entry.is_object()) continue;
++        ExtraAccount a;
++        a.session = obn::auth::session_from_json(entry);
++        if (!a.session.logged_in()) continue;
++        if (!seen.insert(a.session.user_id).second) continue;
++        a.label   = entry.find("label").as_string();
++        auto en   = entry.find("enabled");
++        a.enabled = en.is_bool() ? en.as_bool() : true;
++        out.push_back(std::move(a));
++    }
++    return out;
++}
++
++std::vector<ExtraAccount> load(const std::string& path, std::string* err)
++{
++    if (path.empty()) return {};
++    std::ifstream in(path, std::ios::binary);
++    if (!in.good()) return {};
++    std::string text((std::istreambuf_iterator<char>(in)),
++                     std::istreambuf_iterator<char>());
++    return parse(text, err);
++}
++
++std::string labelled_name(const std::string& label, const std::string& name)
++{
++    if (label.empty()) return name;
++    return "[" + label + "] " + name;
++}
++
++} // namespace obn::accounts
+diff --git a/tests/extra_accounts_test.cpp b/tests/extra_accounts_test.cpp
+new file mode 100644
+index 0000000..9aef96b
+--- /dev/null
++++ b/tests/extra_accounts_test.cpp
+@@ -0,0 +1,83 @@
++// Hermetic unit tests for obn::accounts (obn.accounts.json parsing).
++
++#include "obn/extra_accounts.hpp"
++
++#include <cstdio>
++#include <string>
++
++#define EXPECT(r, cond)                                              \
++    do {                                                             \
++        if (cond) {                                                  \
++            (r).passed++;                                            \
++        } else {                                                     \
++            (r).failed++;                                            \
++            std::fprintf(stderr, "FAIL %s:%d: %s\n",                \
++                         __FILE__, __LINE__, #cond);                 \
++        }                                                            \
++    } while (0)
++
++struct Result { int failed = 0; int passed = 0; };
++
++void test_parse(Result& r)
++{
++    std::string err;
++    auto list = obn::accounts::parse(R"({"version":1,"accounts":[
++        {"enabled":true,"label":"Work","account":"a@work.example",
++         "access_token":"tok-a","refresh_token":"ref-a",
++         "expires_at":"2027-01-03T21:12:05Z","user_id":"111","user_name":"Alice"},
++        {"enabled":false,"access_token":"tok-b","user_id":"222"},
++        {"access_token":"tok-c","user_id":"333"}
++    ]})", &err);
++    EXPECT(r, err.empty());
++    EXPECT(r, list.size() == 3);
++    if (list.size() != 3) return;
++    EXPECT(r, list[0].enabled && list[0].label == "Work");
++    EXPECT(r, list[0].session.user_id == "111");
++    EXPECT(r, list[0].session.access_token == "tok-a");
++    EXPECT(r, list[0].session.refresh_token == "ref-a");
++    EXPECT(r, list[0].session.account == "a@work.example");
++    EXPECT(r, list[0].session.region == "GLOBAL");
++    EXPECT(r, list[0].session.expires_at.time_since_epoch().count() != 0);
++    EXPECT(r, !list[1].enabled && list[1].label.empty());
++    EXPECT(r, list[2].enabled);          // enabled defaults to true
++}
++
++void test_skips_unusable_and_duplicates(Result& r)
++{
++    auto list = obn::accounts::parse(R"({"accounts":[
++        {"user_id":"1"},
++        {"access_token":"t"},
++        {"user_id":"3","access_token":"first"},
++        {"user_id":"3","access_token":"second"},
++        "not an object"
++    ]})");
++    EXPECT(r, list.size() == 1);
++    if (list.size() == 1) EXPECT(r, list[0].session.access_token == "first");
++}
++
++void test_bad_input(Result& r)
++{
++    std::string err;
++    EXPECT(r, obn::accounts::parse("{\"accounts\":[", &err).empty());
++    EXPECT(r, !err.empty());
++    EXPECT(r, obn::accounts::parse("").empty());
++    EXPECT(r, obn::accounts::parse("{}").empty());
++    EXPECT(r, obn::accounts::load("/nonexistent/obn.accounts.json").empty());
++}
++
++void test_labelled_name(Result& r)
++{
++    EXPECT(r, obn::accounts::labelled_name("", "P1S") == "P1S");
++    EXPECT(r, obn::accounts::labelled_name("Work", "P1S") == "[Work] P1S");
++}
++
++int main()
++{
++    Result r;
++    test_parse(r);
++    test_skips_unusable_and_duplicates(r);
++    test_bad_input(r);
++    test_labelled_name(r);
++    std::printf("extra_accounts_test: %d passed, %d failed\n", r.passed, r.failed);
++    return r.failed == 0 ? 0 : 1;
++}
+-- 
+2.52.0.windows.1
+

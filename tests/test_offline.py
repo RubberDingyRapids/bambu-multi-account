@@ -294,5 +294,114 @@ class HelperTests(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class InstallerTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="ma_lib_")
+        self.data = os.path.join(self.root, "OrcaSlicer")
+        self.plugins = os.path.join(self.data, "plugins")
+        os.makedirs(self.plugins)
+        self.pkg = os.path.join(self.root, "pkg")
+        self.plat, self.name = ma.platform_lib()
+        os.makedirs(os.path.join(self.pkg, "bin", self.plat))
+        with open(os.path.join(self.pkg, "bin", self.plat, self.name), "wb") as fh:
+            fh.write(b"MULTI ACCOUNT BUILD")
+        with open(os.path.join(self.pkg, "bin", "build.json"), "w", encoding="utf-8") as fh:
+            json.dump({"obn_version": "0.2.27", "upstream": "ce029b2", "built": "2026-10-08"}, fh)
+        self.stock = os.path.join(self.plugins, self.name)
+        stem, ext = os.path.splitext(self.name)
+        self.twin = os.path.join(self.plugins, stem + "_02.08.01" + ext)
+        for f in (self.stock, self.twin):
+            with open(f, "wb") as fh:
+                fh.write(b"STOCK OBN")
+        with open(os.path.join(self.plugins, "BambuSource.dll"), "wb") as fh:
+            fh.write(b"leave me alone")
+        self.inst = ma.LibraryInstaller(self.data, bundle_dir=self.pkg)
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def set_obn(self, version):
+        d = os.path.join(self.data, "orca_plugins", "_subscribed", "u", "p", "__whl_extracted__",
+                         "open_bambu_networking", "open_bambu_networking-%s.dist-info" % version)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "METADATA"), "w", encoding="utf-8") as fh:
+            fh.write("Metadata-Version: 2.1\nName: open_bambu_networking\nVersion: %s\n" % version)
+
+    def read(self, path):
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    def test_states_and_version_gate(self):
+        self.set_obn("0.2.27")
+        self.assertEqual(ma.obn_plugin_version(self.data), "0.2.27")
+        st = self.inst.state(bridge_loaded=True, bridge_live=False)
+        self.assertEqual((st["state"], st["bundle_obn"], st["installed"]), ("can_install", "0.2.27", False))
+        self.set_obn("0.2.28")                                  # his plugin moved on: don't roll it back
+        self.assertEqual(ma.obn_plugin_version(self.data), "0.2.28")
+        self.assertEqual(self.inst.state(True, False)["state"], "outdated")
+        self.assertEqual(self.inst.state(True, True)["state"], "live")
+        self.assertEqual(ma.LibraryInstaller(self.data, bundle_dir=self.root).state(True, False)["state"], "no_bundle")
+        empty = os.path.join(self.root, "empty")
+        os.makedirs(os.path.join(empty, "plugins"))
+        self.assertEqual(ma.LibraryInstaller(empty, bundle_dir=self.pkg).state(False, False)["state"], "no_obn")
+
+    def test_install_and_undo(self):
+        self.set_obn("0.2.27")
+        self.assertEqual(self.inst.install(), 2)
+        self.assertEqual(self.read(self.stock), b"MULTI ACCOUNT BUILD")
+        self.assertEqual(self.read(self.twin), b"MULTI ACCOUNT BUILD")
+        self.assertEqual(self.read(os.path.join(self.plugins, "BambuSource.dll")), b"leave me alone")
+        st = self.inst.state(True, False)
+        self.assertEqual((st["state"], st["can_undo"]), ("restart", True))
+        self.inst.install()                                      # again: backup must keep the stock copy
+        self.assertEqual(self.read(os.path.join(self.inst.backup_dir, self.name)), b"STOCK OBN")
+        self.assertEqual(self.inst.undo(), 2)
+        self.assertEqual(self.read(self.stock), b"STOCK OBN")
+        self.assertFalse(os.path.exists(self.inst.backup_dir))
+        with self.assertRaises(RuntimeError):
+            self.inst.undo()
+
+    def test_locked_library_is_moved_aside(self):
+        self.set_obn("0.2.27")
+        real_copy = ma.shutil.copyfile
+        locked = {self.stock}
+
+        def copy(src, dst):
+            if dst in locked:
+                locked.discard(dst)                              # only the first write hits the lock
+                raise PermissionError(13, "in use")
+            return real_copy(src, dst)
+
+        ma.shutil.copyfile = copy
+        try:
+            self.inst.install()
+        finally:
+            ma.shutil.copyfile = real_copy
+        self.assertEqual(self.read(self.stock), b"MULTI ACCOUNT BUILD")
+        aside = [f for f in os.listdir(self.plugins) if ".old-" in f]
+        self.assertEqual(len(aside), 1)
+        self.inst.cleanup()
+        self.assertEqual([f for f in os.listdir(self.plugins) if ".old-" in f], [])
+
+    def test_core_actions(self):
+        self.set_obn("0.2.27")
+        core = ma.MultiAccountCore(base_dir=self.data, api_factory=FakeApi, bridge=FakeBridge(live=False),
+                                   installer=self.inst)
+        self.assertEqual(core.handle({"action": "state"})["state"]["library"]["state"], "can_install")
+        r = core.handle({"action": "install_library"})
+        self.assertTrue(r["ok"], r)
+        self.assertIn("Restart", r["message"])
+        self.assertEqual(r["state"]["library"]["state"], "restart")
+        r = core.handle({"action": "undo_library"})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["state"]["library"]["state"], "can_install")
+
+    def test_no_install_without_obn(self):
+        core_dir = os.path.join(self.root, "bare")
+        os.makedirs(os.path.join(core_dir, "plugins"))
+        with self.assertRaises(RuntimeError):
+            ma.LibraryInstaller(core_dir, bundle_dir=self.pkg).install()
+
+
 if __name__ == "__main__":
     unittest.main()

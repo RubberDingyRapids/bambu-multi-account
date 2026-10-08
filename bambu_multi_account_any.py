@@ -6,7 +6,7 @@
 # name = "Bambu Multi Account"
 # description = "Use more than one Bambu Lab account in OrcaSlicer at once, e.g. work and home: printers from every account show up together in the Device tab and the print dialog. Needs the Open Bambu Networking plugin. On an Open Bambu Networking build without multi-account support it can still swap which account is the main one (takes effect after a restart)."
 # author = "Elliott (Trevor Bolton Engineering Services)"
-# version = "0.1.2"
+# version = "0.2.0"
 # ///
 """Bambu Multi Account for OrcaSlicer.
 
@@ -36,9 +36,13 @@ token beyond that swap, and never sends tokens anywhere but Bambu's API.
 """
 import ctypes
 import datetime as _dt
+import glob
+import hashlib
 import http.client
 import json
 import os
+import re
+import shutil
 import ssl
 import sys
 import time
@@ -48,7 +52,7 @@ try:
 except ImportError:          # imported by the offline tests
     orca = None
 
-PLUGIN_VERSION = "0.1.2"
+PLUGIN_VERSION = "0.2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 ACCOUNTS_FILE = "obn.accounts.json"
@@ -77,7 +81,7 @@ def data_dir():
     ``orca_plugins`` folder and take its parent. Falls back to %APPDATA%.
     """
     p = HERE
-    for _ in range(6):
+    for _ in range(9):
         if os.path.basename(p).lower() == "orca_plugins":
             return os.path.dirname(p)
         parent = os.path.dirname(p)
@@ -351,6 +355,7 @@ class ObnBridge:
         self.lib = None
         self.api = 0
         self.error = ""
+        self.loaded = False            # some networking library is loaded, with or without the exports
         self._find()
 
     def _candidates(self):
@@ -386,12 +391,14 @@ class ObnBridge:
                     lib = ctypes.CDLL(name, mode=mode)
             except OSError:
                 continue
+            self.loaded = True
             try:
                 fn = lib.obn_extra_accounts_api
             except AttributeError:
                 self.lib = None
-                self.error = ("The installed Open Bambu Networking library has no multi-account "
-                              "support yet. You can still swap the main account (needs a restart).")
+                self.error = ("The Open Bambu Networking library that's loaded doesn't have multi "
+                              "account in it. Install the multi account build below, or you can still "
+                              "swap the main account (needs a restart).")
                 return
             fn.restype = ctypes.c_int
             fn.argtypes = []
@@ -428,15 +435,173 @@ class ObnBridge:
 
 
 # ---------------------------------------------------------------------------
+# Bundled multi-account library (wheel builds ship one per platform)
+# ---------------------------------------------------------------------------
+
+def platform_lib():
+    """(bin folder in the wheel, library file name OrcaSlicer loads)."""
+    if sys.platform == "win32":
+        return "win_x64", "bambu_networking.dll"
+    if sys.platform == "darwin":
+        return "macos_arm64", "libbambu_networking.dylib"
+    return "linux_x64", "libbambu_networking.so"
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:4]) or (0,)
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def obn_plugin_version(base_dir):
+    """Version of the Open Bambu Networking plugin installed in OrcaSlicer, or ""."""
+    root = os.path.join(base_dir, "orca_plugins")
+    best = ""
+    for meta in glob.glob(os.path.join(root, "**", "open_bambu_networking-*.dist-info", "METADATA"), recursive=True):
+        try:
+            with open(meta, "r", encoding="utf-8") as fh:
+                m = re.search(r"^Version:\s*(\S+)", fh.read(), re.M)
+        except OSError:
+            continue
+        if m and version_tuple(m.group(1)) > version_tuple(best):
+            best = m.group(1)
+    return best
+
+
+class LibraryInstaller:
+    """Swaps the networking library OrcaSlicer loads for the multi-account build
+    shipped in this plugin's wheel, and back.
+
+    The bundled build is persano's open-bamboo-networking at a given commit plus
+    the multi-account patch; ``bin/build.json`` says which Open Bambu Networking
+    plugin version that commit belongs to. It is only offered when it is at
+    least as new as the installed one, so installing it never rolls back a fix.
+    The library in use can't be overwritten on Windows, but it can be renamed,
+    so the old file is moved aside and the new one copied in; OrcaSlicer picks
+    it up on the next start. The first non-multi-account copy of each file is
+    kept in ``plugins/multi_account_backup`` for "put the original back".
+    """
+
+    def __init__(self, base_dir, bundle_dir=None):
+        self.base_dir = base_dir
+        self.plugins_dir = os.path.join(base_dir, "plugins")
+        self.backup_dir = os.path.join(self.plugins_dir, "multi_account_backup")
+        self.bundle_dir = os.path.join(bundle_dir or HERE, "bin")
+        self.plat, self.lib_name = platform_lib()
+
+    def bundled(self):
+        """{path, sha256, obn_version, upstream, built} or None when this install has no bundle."""
+        path = os.path.join(self.bundle_dir, self.plat, self.lib_name)
+        if not os.path.isfile(path):
+            return None
+        info = {}
+        try:
+            info = read_json(os.path.join(self.bundle_dir, "build.json")) or {}
+        except (OSError, ValueError):
+            pass
+        return {"path": path, "sha256": file_sha256(path), "obn_version": info.get("obn_version", ""),
+                "upstream": info.get("upstream", ""), "built": info.get("built", "")}
+
+    def targets(self):
+        """Every copy of the networking library in plugins/ (OBN writes a versioned twin on Windows)."""
+        stem, ext = os.path.splitext(self.lib_name)
+        try:
+            files = os.listdir(self.plugins_dir)
+        except OSError:
+            return []
+        out = []
+        for f in files:
+            if f == self.lib_name or (f.startswith(stem + "_") and f.endswith(ext)):
+                out.append(os.path.join(self.plugins_dir, f))
+        return sorted(out)
+
+    def state(self, bridge_loaded, bridge_live):
+        b = self.bundled()
+        obn = obn_plugin_version(self.base_dir)
+        targets = self.targets()
+        installed = bool(b) and bool(targets) and all(file_sha256(t) == b["sha256"] for t in targets)
+        has_backup = os.path.isdir(self.backup_dir) and bool(os.listdir(self.backup_dir))
+        st = {"bundle": bool(b), "bundle_obn": (b or {}).get("obn_version", ""), "bundle_upstream": (b or {}).get("upstream", ""),
+              "obn_version": obn, "installed": installed, "can_undo": has_backup and installed}
+        if bridge_live:
+            st["state"] = "live"
+        elif not targets and not bridge_loaded:
+            st["state"] = "no_obn"
+        elif installed:
+            st["state"] = "restart"
+        elif not b:
+            st["state"] = "no_bundle"
+        elif obn and version_tuple(b["obn_version"]) < version_tuple(obn):
+            st["state"] = "outdated"
+        else:
+            st["state"] = "can_install"
+        return st
+
+    def _place(self, src, dst):
+        """Copy src over dst, moving a locked (loaded) dst aside first."""
+        try:
+            shutil.copyfile(src, dst)
+            return
+        except PermissionError:
+            pass
+        aside = "%s.old-%d" % (dst, int(time.time()))
+        os.replace(dst, aside)
+        shutil.copyfile(src, dst)
+
+    def cleanup(self):
+        """Delete files moved aside by an earlier swap; they unlock once OrcaSlicer restarts."""
+        stem, ext = os.path.splitext(self.lib_name)
+        for old in glob.glob(os.path.join(self.plugins_dir, stem + "*" + ext + ".old-*")):
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+
+    def install(self):
+        b = self.bundled()
+        if not b:
+            raise RuntimeError("This copy of the plugin has no multi account library in it.")
+        targets = self.targets()
+        if not targets:
+            raise RuntimeError("No Open Bambu Networking library found. Install it from its own tab first.")
+        os.makedirs(self.backup_dir, exist_ok=True)
+        for t in targets:
+            if file_sha256(t) == b["sha256"]:
+                continue
+            shutil.copyfile(t, os.path.join(self.backup_dir, os.path.basename(t)))
+            self._place(b["path"], t)
+        return len(targets)
+
+    def undo(self):
+        try:
+            names = sorted(os.listdir(self.backup_dir))
+        except OSError:
+            names = []
+        if not names:
+            raise RuntimeError("No backup to put back.")
+        for n in names:
+            self._place(os.path.join(self.backup_dir, n), os.path.join(self.plugins_dir, n))
+        shutil.rmtree(self.backup_dir, ignore_errors=True)
+        return len(names)
+
+
+# ---------------------------------------------------------------------------
 # Core (independent of the orca module so the tests can drive it)
 # ---------------------------------------------------------------------------
 
 class MultiAccountCore:
-    def __init__(self, base_dir=None, api_factory=None, bridge=None):
+    def __init__(self, base_dir=None, api_factory=None, bridge=None, installer=None):
         self.base_dir = base_dir or data_dir()
         self.store = AccountStore(self.base_dir).load()
         self.api_factory = api_factory or BambuApi
         self.bridge = bridge if bridge is not None else ObnBridge(self.base_dir)
+        self.installer = installer if installer is not None else LibraryInstaller(self.base_dir)
         self.pending_login = None     # {"email": ...} while waiting for a code
         self.printers = {}            # user_id -> [printer] from the last fetch
         self.notice = ""
@@ -618,13 +783,25 @@ class MultiAccountCore:
             "pending_email": (self.pending_login or {}).get("email", ""),
             "restart_needed": self.restart_needed,
             "notice": self.notice,
+            "library": self.library_state(),
         }
+
+    def library_state(self):
+        try:
+            return self.installer.state(getattr(self.bridge, "loaded", self.bridge.live), self.bridge.live)
+        except Exception as e:  # noqa: BLE001
+            _log("library state: %r" % e)
+            return {"state": "error", "error": str(e)}
 
     # -- message dispatch ---------------------------------------------------------------
     def startup(self):
         """on_load: refresh tokens that are due and hand the file to the library.
         The library also reads it when the cloud connection comes up, so this is
         only needed for tokens that were refreshed."""
+        try:
+            self.installer.cleanup()
+        except Exception as e:  # noqa: BLE001
+            _log("cleanup: %r" % e)
         if not self.store.accounts:
             return
         try:
@@ -658,6 +835,12 @@ class MultiAccountCore:
                 reply["message"] = self.remove(data.get("user_id"))
             elif action == "make_primary":
                 reply["message"] = self.make_primary(data.get("user_id"))
+            elif action == "install_library":
+                n = self.installer.install()
+                reply["message"] = "Multi account library in place (%d file%s). Restart OrcaSlicer to use it." % (n, "" if n == 1 else "s")
+            elif action == "undo_library":
+                n = self.installer.undo()
+                reply["message"] = "Original library put back (%d file%s). Restart OrcaSlicer." % (n, "" if n == 1 else "s")
             elif action == "refresh":
                 self.store.load()
                 failed = self.refresh_tokens(force=bool(data.get("force")))
@@ -770,9 +953,15 @@ function render(){
   mode.innerHTML = st.live ? '<span class="dot ok"></span>All accounts live' : '<span class="dot warn"></span>Main account only';
   mode.title = st.live ? 'Open Bambu Networking runs every enabled account side by side.' : (st.bridge_error||'');
   var b='';
-  if(!st.live && st.bridge_error) b+='<div class="banner">'+esc(st.bridge_error)+'</div>';
+  var L = st.library||{};
+  if(L.state==='can_install') b+='<div class="banner info"><b>Turn on multi account</b><br>The Open Bambu Networking library you have doesnt run more than one account. This plugin comes with one that does: OBN '+esc(L.bundle_obn||'?')+' plus multi account. Your current one gets backed up so you can go back.<div class="row" style="margin-top:8px"><button class="primary" data-lib="install_library">Install multi account library</button><span class="muted small">needs an OrcaSlicer restart</span></div></div>';
+  else if(L.state==='restart') b+='<div class="banner info">Multi account library is in. Restart OrcaSlicer to start using it.'+(L.can_undo?' <button data-lib="undo_library">Put the original back</button>':'')+'</div>';
+  else if(L.state==='outdated') b+='<div class="banner">Your Open Bambu Networking is '+esc(L.obn_version)+' but the multi account build in this plugin is for '+esc(L.bundle_obn)+'. A new build normally lands within a day, update this plugin then. Installing the old one would undo the newer fixes, so its not offered.</div>';
+  else if(L.state==='no_obn') b+='<div class="banner">Open Bambu Networking isnt installed. Subscribe to it on the plugin hub, install it from its tab, restart and log in to Bambu, then come back here.</div>';
+  else if(!st.live && st.bridge_error) b+='<div class="banner">'+esc(st.bridge_error)+'</div>';
   if(st.restart_needed) b+='<div class="banner">Restart OrcaSlicer to finish switching the main account.</div>';
   if(st.notice) b+='<div class="banner">'+esc(st.notice)+'</div>';
+  if(st.live && L.can_undo) b+='<div class="muted small" style="margin:-4px 0 10px">Running the multi account build of Open Bambu Networking. <a href="#" data-lib="undo_library">Put the original back</a></div>';
   $('banners').innerHTML=b;
   var p=st.primary;
   $('primary').innerHTML = p.user_id
@@ -819,6 +1008,7 @@ document.addEventListener('change', function(ev){
 });
 document.addEventListener('click', function(ev){
   var t=ev.target;
+  if(t.dataset && t.dataset.lib){ ev.preventDefault(); send({action:t.dataset.lib}); return; }
   if(t.dataset.rm){ if(t.dataset.confirm){ send({action:'remove', user_id:t.dataset.rm}); } else { t.dataset.confirm='1'; t.textContent='Click again to remove'; } }
   else if(t.dataset.main){ if(t.dataset.confirm){ send({action:'make_primary', user_id:t.dataset.main}); } else { t.dataset.confirm='1'; t.textContent='Click again: swap and restart later'; } }
 });

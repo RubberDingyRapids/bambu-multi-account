@@ -1,39 +1,237 @@
+# builds open bambu networking + the multi account patch for windows, linux and mac,
+# packs it into the plugin wheels, makes a github release and publishes it to orca cloud.
+#
+# - daily (and by hand): only builds when persano's code, the patch or the plugin changed
+# - a release made by hand: just republishes that release's wheels
+#
+# everything lives in this one file so orca cloud always sees the same connected workflow.
+
 name: Publish to OrcaCloud
 
 on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "build even if nothing changed"
+        type: boolean
+        default: false
   release:
     types: [published]
 
 permissions:
   id-token: write
-  contents: read
+  contents: write
 
 env:
-  PLUGIN_FILES: "bambu_multi_account_any.py"
+  UPSTREAM: persano/open-bamboo-networking
+  UPSTREAM_BRANCH: option-b-cloud-rescue
+  OBN_PLUGIN: persano/open-bambu-networking-plugin
+  ABI: "02.08.01"
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  check:
+    if: github.event_name != 'release' || github.event.release.author.login != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      upstream: ${{ steps.plan.outputs.upstream }}
+      obn_version: ${{ steps.plan.outputs.obn_version }}
+      version: ${{ steps.plan.outputs.version }}
+      key: ${{ steps.plan.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name != 'release'
+
+      - name: work out what to build
+        id: plan
+        if: github.event_name != 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone -q --branch "$UPSTREAM_BRANCH" "https://github.com/$UPSTREAM.git" upstream
+          upstream="$(git -C upstream rev-parse HEAD)"
+
+          # which open bambu networking plugin release is this commit (or the newest one it contains)
+          curl -sSL "https://raw.githubusercontent.com/$OBN_PLUGIN/HEAD/CHANGELOG.md" -o obn_changelog.md
+          obn_version=""
+          while read -r ver sha; do
+            if git -C upstream merge-base --is-ancestor "$sha" "$upstream" 2>/dev/null; then obn_version="$ver"; break; fi
+          done < <(python3 - <<'EOF'
+          import re
+          text = open("obn_changelog.md", encoding="utf-8").read()
+          for block in re.split(r"^## ", text, flags=re.M)[1:]:
+              ver = block.split()[0]
+              m = re.search(r"open-bamboo-networking\s+`([0-9a-f]{7,40})`", block)
+              if m:
+                  print(ver, m.group(1))
+          EOF
+          )
+          [ -n "$obn_version" ] || { echo "couldnt match upstream to an obn plugin release" >&2; exit 1; }
+
+          key="$upstream-$(cat bambu_multi_account_any.py obn/multi-account.patch 2>/dev/null | sha256sum | cut -c1-12)"
+
+          last_tag="$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')"
+          last_key=""
+          [ -n "$last_tag" ] && last_key="$(gh release view "$last_tag" --json body --jq .body | sed -n 's/.*build-key: \([0-9a-f-]*\).*/\1/p' | head -1)"
+
+          build=true
+          if [ "$key" = "$last_key" ] && [ "${{ inputs.force }}" != "true" ]; then build=false; fi
+
+          py_ver="$(sed -n 's/^# version = "\(.*\)"$/\1/p' bambu_multi_account_any.py)"
+          version="$(python3 - "$py_ver" "${last_tag#v}" <<'EOF'
+          import sys
+          t = lambda v: tuple(int(x) for x in v.split(".")) if v else (0, 0, 0)
+          py, last = t(sys.argv[1]), t(sys.argv[2])
+          nxt = (last[0], last[1], last[2] + 1)
+          print(".".join(map(str, max(py, nxt))))
+          EOF
+          )"
+          echo "upstream=$upstream obn=$obn_version key=$key last=$last_key build=$build version=$version"
+          {
+            echo "build=$build"; echo "upstream=$upstream"; echo "obn_version=$obn_version"
+            echo "version=$version"; echo "key=$key"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - plat: win_x64
+            os: windows-2022
+            lib: bambu_networking.dll
+          - plat: linux_x64
+            os: ubuntu-24.04
+            lib: libbambu_networking.so
+          - plat: macos_arm64
+            os: macos-latest
+            lib: libbambu_networking.dylib
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: self
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.check.outputs.upstream }}
+          path: obn
+
+      - name: apply the multi account patch
+        shell: bash
+        working-directory: obn
+        run: git apply --3way ../self/obn/multi-account.patch
+
+      - name: deps (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake pkg-config ca-certificates git \
+            libcjson-dev uthash-dev libcurl4-openssl-dev libssl-dev zlib1g-dev
+
+      - name: deps (mac)
+        if: runner.os == 'macOS'
+        run: |
+          for pkg in pkg-config cmake openssl@3 uthash; do brew list "$pkg" &>/dev/null || brew install "$pkg"; done
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: build (linux, mac)
+        if: runner.os != 'Windows'
+        working-directory: obn
+        run: |
+          ./configure --build-type=Release --enable-tests --with-version="${ABI}.99" --no-conf-patch
+          make -j"$( (nproc || sysctl -n hw.ncpu) 2>/dev/null )"
+          make test
+          mkdir -p ../out && cp "build/${{ matrix.lib }}" ../out/
+
+      - name: build (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: obn
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $staging = Join-Path $env:GITHUB_WORKSPACE "install"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          .\configure.ps1 -ClientType bambu_studio -WithVersion "$env:ABI.99" -Prefix $staging `
+            -Architecture x64 -VcpkgTriplet x64-windows-static-md -PatchConf:$false `
+            -RegisterDShowFilter:$false -EnableTests:$true
+          cmake --build build --config Release --parallel
+          Push-Location build; ctest -C Release --output-on-failure; Pop-Location
+          cmake --install build --config Release
+          New-Item -ItemType Directory -Force -Path ..\out | Out-Null
+          Copy-Item (Join-Path $staging 'plugins\${{ matrix.lib }}') ..\out\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.plat }}
+          path: out/${{ matrix.lib }}
+          if-no-files-found: error
+
+  release:
+    needs: [check, build]
+    if: always() && needs.check.outputs.build == 'true' && needs.build.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Publish release to OrcaCloud
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: pack the wheels
         run: |
           set -euo pipefail
-          oidc_token="$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=orcacloud" | jq -r .value)"
-          version="${GITHUB_REF_NAME#v}"
-          changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" | head -c 4000)"
-          metadata="$(jq -cn --arg version "$version" --arg changelog "$changelog"             '{version: $version} + (if $changelog == "" then {} else {changelog: $changelog} end)')"
-          args=(--form-string "metadata=$metadata")
-          shopt -s nullglob
-          for file in $PLUGIN_FILES; do
-            args+=(-F "files=@$file")
-          done
-          if [ "${#args[@]}" -eq 1 ]; then
-            echo "No plugin files matched: $PLUGIN_FILES" >&2
-            exit 1
-          fi
-          status="$(curl -sS -o response.json -w '%{http_code}'             -H "Authorization: Bearer $oidc_token"             "${args[@]}"             https://api.orcaslicer.com/api/v1/plugin-publish/releases)"
-          cat response.json
-          echo
-          [ "$status" = "201" ]
+          mkdir -p libs
+          for d in artifacts/lib-*; do plat="${d#artifacts/lib-}"; mkdir -p "libs/$plat"; cp "$d"/* "libs/$plat/"; done
+          printf '{"obn_version": "%s", "upstream": "%s", "built": "%s"}\n' \
+            "${{ needs.check.outputs.obn_version }}" "${{ needs.check.outputs.upstream }}" "$(date -u +%Y-%m-%d)" > libs/build.json
+          python3 tools/build_wheels.py "$VERSION" libs dist
+          ls -l dist
+
+      - name: make the github release
+        run: |
+          set -euo pipefail
+          up="${{ needs.check.outputs.upstream }}"
+          missing=""
+          for p in win_x86_64 linux_x86_64 macosx_arm64; do [ -f "dist/bambu_multi_account_$p.whl" ] || missing="$missing $p"; done
+          notes="multi account build for open bambu networking ${{ needs.check.outputs.obn_version }} (persanos \`${up:0:7}\`)"
+          [ -n "$missing" ] && notes="$notes. build failed for:$missing so theres no wheel for those this time"
+          notes="$notes
+
+          build-key: ${{ needs.check.outputs.key }}"
+          gh release create "v$VERSION" dist/*.whl --title "$VERSION" --notes "$notes" --target "$GITHUB_SHA"
+          echo "$notes" > release_notes.txt
+
+      - name: publish to orca cloud
+        run: |
+          set -euo pipefail
+          publish() { bash .github/publish.sh "$1" "$2" dist/*.whl; }
+          publish "$VERSION" "$(head -c 4000 release_notes.txt | sed '/^build-key:/d')"
+
+  republish:
+    if: github.event_name == 'release' && github.event.release.author.login != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: publish this release to orca cloud
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "$GITHUB_REF_NAME" -p '*.whl' -D dist
+          changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" | sed '/^build-key:/d' | head -c 4000)"
+          bash .github/publish.sh "${GITHUB_REF_NAME#v}" "$changelog" dist/*.whl
