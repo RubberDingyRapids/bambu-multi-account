@@ -31,10 +31,21 @@ Requirements:
 subscribe to it on the orca cloud plugin hub. keep persano's open bambu
 networking plugin installed too, this sits on top of it.
 
-the multi account bit needs a change in the networking library that
-persano hasnt merged yet ([PR #2](https://github.com/persano/open-bamboo-networking/pull/2)),
-so the hub version of this plugin comes with its own build of his library:
-his latest code plus the multi account patch, for windows, linux and mac.
+the multi account bit needs changes in the networking library itself, so
+the hub version of this plugin comes with its own build of persano's
+library for windows, linux and mac: his latest code plus three patches
+(they're in `obn/` in the publish repo):
+
+- multi account: runs the extra accounts and routes each printer through
+  the account that owns it
+- client_name: an old `client_name = OpenBambooNetworking` in obn.conf
+  gets treated as `BambuStudio`, otherwise bambu's cloud refuses the
+  camera and prints with a 403
+- h2 print fix: always sends the PoP headers on the cloud print call, so
+  H2S/H2D cloud prints dont 403 (his `mytask_pop` setting is off by
+  default and his template writes it as 0). `mytask_pop_disable = 1` in
+  obn.conf turns it off if you ever need to
+
 first time you open the tab it says "turn on multi account" with an install
 button. that backs up the library you have, puts the multi account one in,
 and you restart orca. theres a "put the original back" link if you want to

@@ -75,7 +75,7 @@ jobs:
           )
           [ -n "$obn_version" ] || { echo "couldnt match upstream to an obn plugin release" >&2; exit 1; }
 
-          key="$upstream-$(cat bambu_multi_account_any.py obn/multi-account.patch 2>/dev/null | sha256sum | cut -c1-12)"
+          key="$upstream-$(cat bambu_multi_account_any.py obn/*.patch | sha256sum | cut -c1-12)"
 
           last_tag="$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')"
           last_key=""
@@ -127,10 +127,12 @@ jobs:
           ref: ${{ needs.check.outputs.upstream }}
           path: obn
 
-      - name: apply the multi account patch
+      - name: apply our patches (multi account, client_name, h2 print fix)
         shell: bash
         working-directory: obn
-        run: git apply --3way ../self/obn/multi-account.patch
+        run: |
+          set -e
+          for p in ../self/obn/*.patch; do echo "applying $p"; git apply --3way "$p"; done
 
       - name: deps (linux)
         if: runner.os == 'Linux'

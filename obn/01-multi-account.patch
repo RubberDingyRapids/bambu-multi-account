@@ -1,4 +1,4 @@
-From b0181d4cb5ded568e39b4ea711f3c644be14edf1 Mon Sep 17 00:00:00 2001
+From 05c030e3d3e98134da4e98e6375ed257dde7508e Mon Sep 17 00:00:00 2001
 From: RubberDingyRapids <smellthellama@gmail.com>
 Date: Wed, 7 Oct 2026 20:00:55 +0100
 Subject: [PATCH] cloud: run extra Bambu accounts next to the logged-in one
@@ -863,10 +863,10 @@ index fd525ae..11b6d4b 100644
      if (http_json_success(resp.body, resp.status_code)) return BAMBU_NETWORK_SUCCESS;
      return BAMBU_NETWORK_ERR_UNBIND_FAILED;
 diff --git a/src/cloud_print.cpp b/src/cloud_print.cpp
-index f90446d..00b2af8 100644
+index b754e35..77e69a4 100644
 --- a/src/cloud_print.cpp
 +++ b/src/cloud_print.cpp
-@@ -856,7 +856,9 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
+@@ -881,7 +881,9 @@ int Agent::run_cloud_print_job(const BBL::PrintParams& p,
          return BAMBU_NETWORK_ERR_INVALID_HANDLE;
      }
  
