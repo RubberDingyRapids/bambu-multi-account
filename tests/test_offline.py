@@ -396,6 +396,34 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertEqual(r["state"]["library"]["state"], "can_install")
 
+    def test_two_series_go_to_matching_files(self):
+        self.set_obn("0.2.32")
+        pkg = os.path.join(self.root, "pkg2")
+        for abi in ("02.08.04", "02.08.01"):
+            os.makedirs(os.path.join(pkg, "bin", self.plat, abi))
+            with open(os.path.join(pkg, "bin", self.plat, abi, self.name), "wb") as fh:
+                fh.write(("MULTI " + abi).encode())
+        with open(os.path.join(pkg, "bin", "build.json"), "w", encoding="utf-8") as fh:
+            json.dump({"obn_version": "0.2.32", "upstream": "da9d91f"}, fh)
+        stem, ext = os.path.splitext(self.name)
+        new_series = os.path.join(self.plugins, stem + "_02.08.04" + ext)
+        odd_series = os.path.join(self.plugins, stem + "_02.08.07" + ext)    # reported_version override
+        for f in (new_series, odd_series):
+            with open(f, "wb") as fh:
+                fh.write(b"STOCK OBN")
+        inst = ma.LibraryInstaller(self.data, bundle_dir=pkg)
+        self.assertEqual(sorted(inst.bundled()["series"]), ["02.08.01", "02.08.04"])
+        self.assertEqual(inst.state(True, False)["state"], "can_install")
+        self.assertEqual(inst.install(), 4)
+        self.assertEqual(self.read(self.twin), b"MULTI 02.08.01")         # _02.08.01 gets the 02.08.01 build
+        self.assertEqual(self.read(new_series), b"MULTI 02.08.04")
+        self.assertEqual(self.read(self.stock), b"MULTI 02.08.04")        # plain name gets the newest
+        self.assertEqual(self.read(odd_series), b"MULTI 02.08.04")        # unshipped series gets the newest
+        self.assertEqual(inst.state(True, False)["state"], "restart")
+        inst.undo()
+        self.assertEqual(self.read(self.twin), b"STOCK OBN")
+        self.assertEqual(self.read(new_series), b"STOCK OBN")
+
     def test_no_install_without_obn(self):
         core_dir = os.path.join(self.root, "bare")
         os.makedirs(os.path.join(core_dir, "plugins"))

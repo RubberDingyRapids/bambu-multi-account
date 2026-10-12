@@ -28,7 +28,6 @@ env:
   UPSTREAM: persano/open-bamboo-networking
   UPSTREAM_BRANCH: option-b-cloud-rescue
   OBN_PLUGIN: persano/open-bambu-networking-plugin
-  ABI: "02.08.01"
 
 concurrency:
   group: publish
@@ -105,6 +104,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # orca builds from ee2c40ea load the 02.08.04 library, older ones 02.08.01, so build both
+        abi: ["02.08.04", "02.08.01"]
+        plat: [win_x64, linux_x64, macos_arm64]
         include:
           - plat: win_x64
             os: windows-2022
@@ -126,6 +128,9 @@ jobs:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ needs.check.outputs.upstream }}
           path: obn
+          # full history: when persano's code has moved on since the patches were made,
+          # git apply --3way needs the old file versions to merge them in
+          fetch-depth: 0
 
       - name: apply our patches (multi account, client_name, h2 print fix)
         shell: bash
@@ -152,7 +157,7 @@ jobs:
         if: runner.os != 'Windows'
         working-directory: obn
         run: |
-          ./configure --build-type=Release --enable-tests --with-version="${ABI}.99" --no-conf-patch
+          ./configure --build-type=Release --enable-tests --with-version="${{ matrix.abi }}.99" --no-conf-patch
           make -j"$( (nproc || sysctl -n hw.ncpu) 2>/dev/null )"
           make test
           mkdir -p ../out && cp "build/${{ matrix.lib }}" ../out/
@@ -165,7 +170,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $staging = Join-Path $env:GITHUB_WORKSPACE "install"
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          .\configure.ps1 -ClientType bambu_studio -WithVersion "$env:ABI.99" -Prefix $staging `
+          .\configure.ps1 -ClientType bambu_studio -WithVersion "${{ matrix.abi }}.99" -Prefix $staging `
             -Architecture x64 -VcpkgTriplet x64-windows-static-md -PatchConf:$false `
             -RegisterDShowFilter:$false -EnableTests:$true
           cmake --build build --config Release --parallel
@@ -176,7 +181,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lib-${{ matrix.plat }}
+          name: lib-${{ matrix.plat }}-${{ matrix.abi }}
           path: out/${{ matrix.lib }}
           if-no-files-found: error
 
@@ -204,7 +209,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p libs
-          for d in artifacts/lib-*; do plat="${d#artifacts/lib-}"; mkdir -p "libs/$plat"; cp "$d"/* "libs/$plat/"; done
+          for d in artifacts/lib-*; do
+            name="${d#artifacts/lib-}"; plat="${name%-*}"; abi="${name##*-}"
+            mkdir -p "libs/$plat/$abi"; cp "$d"/* "libs/$plat/$abi/"
+          done
+          find libs -type f | sort
           printf '{"obn_version": "%s", "upstream": "%s", "built": "%s"}\n' \
             "${{ needs.check.outputs.obn_version }}" "${{ needs.check.outputs.upstream }}" "$(date -u +%Y-%m-%d)" > libs/build.json
           python3 tools/build_wheels.py "$VERSION" libs dist

@@ -6,7 +6,7 @@
 # name = "Bambu Multi Account"
 # description = "Use more than one Bambu Lab account in OrcaSlicer at once, e.g. work and home: printers from every account show up together in the Device tab and the print dialog. Needs the Open Bambu Networking plugin. On an Open Bambu Networking build without multi-account support it can still swap which account is the main one (takes effect after a restart)."
 # author = "Elliott (Trevor Bolton Engineering Services)"
-# version = "0.2.0"
+# version = "0.3.0"
 # ///
 """Bambu Multi Account for OrcaSlicer.
 
@@ -52,7 +52,7 @@ try:
 except ImportError:          # imported by the offline tests
     orca = None
 
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 ACCOUNTS_FILE = "obn.accounts.json"
@@ -496,17 +496,48 @@ class LibraryInstaller:
         self.plat, self.lib_name = platform_lib()
 
     def bundled(self):
-        """{path, sha256, obn_version, upstream, built} or None when this install has no bundle."""
-        path = os.path.join(self.bundle_dir, self.plat, self.lib_name)
-        if not os.path.isfile(path):
+        """{series: {abi: {path, sha256}}, obn_version, upstream, built} or None with no bundle.
+
+        Wheels carry one build per library series (bin/<plat>/02.08.04/..., 02.08.01/...)
+        because OrcaSlicer builds from ee2c40ea load bambu_networking_02.08.04 and older
+        ones 02.08.01. A wheel from before that has a single build at bin/<plat>/<lib>,
+        which then serves every file (series "")."""
+        root = os.path.join(self.bundle_dir, self.plat)
+        series = {}
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            names = []
+        for abi in names:
+            path = os.path.join(root, abi, self.lib_name)
+            if os.path.isfile(path):
+                series[abi] = {"path": path, "sha256": file_sha256(path)}
+        flat = os.path.join(root, self.lib_name)
+        if not series and os.path.isfile(flat):
+            series[""] = {"path": flat, "sha256": file_sha256(flat)}
+        if not series:
             return None
         info = {}
         try:
             info = read_json(os.path.join(self.bundle_dir, "build.json")) or {}
         except (OSError, ValueError):
             pass
-        return {"path": path, "sha256": file_sha256(path), "obn_version": info.get("obn_version", ""),
+        return {"series": series, "obn_version": info.get("obn_version", ""),
                 "upstream": info.get("upstream", ""), "built": info.get("built", "")}
+
+    def pick(self, target, bundle):
+        """Which bundled build goes into this file. bambu_networking_<series>.* gets that
+        series; the plain name, and a series we don't ship (Open Bambu Networking's
+        reported_version override, which it fills from its newest build), get the newest."""
+        series = bundle["series"]
+        if "" in series:
+            return series[""]
+        stem, ext = os.path.splitext(self.lib_name)
+        name = os.path.basename(target)
+        m = re.match(re.escape(stem) + r"_(\d+\.\d+\.\d+)" + re.escape(ext) + "$", name)
+        if m and m.group(1) in series:
+            return series[m.group(1)]
+        return series[max(series, key=version_tuple)]
 
     def targets(self):
         """Every copy of the networking library in plugins/ (OBN writes a versioned twin on Windows)."""
@@ -525,7 +556,7 @@ class LibraryInstaller:
         b = self.bundled()
         obn = obn_plugin_version(self.base_dir)
         targets = self.targets()
-        installed = bool(b) and bool(targets) and all(file_sha256(t) == b["sha256"] for t in targets)
+        installed = bool(b) and bool(targets) and all(file_sha256(t) == self.pick(t, b)["sha256"] for t in targets)
         has_backup = os.path.isdir(self.backup_dir) and bool(os.listdir(self.backup_dir))
         st = {"bundle": bool(b), "bundle_obn": (b or {}).get("obn_version", ""), "bundle_upstream": (b or {}).get("upstream", ""),
               "obn_version": obn, "installed": installed, "can_undo": has_backup and installed}
@@ -572,10 +603,11 @@ class LibraryInstaller:
             raise RuntimeError("No Open Bambu Networking library found. Install it from its own tab first.")
         os.makedirs(self.backup_dir, exist_ok=True)
         for t in targets:
-            if file_sha256(t) == b["sha256"]:
+            build = self.pick(t, b)
+            if file_sha256(t) == build["sha256"]:
                 continue
             shutil.copyfile(t, os.path.join(self.backup_dir, os.path.basename(t)))
-            self._place(b["path"], t)
+            self._place(build["path"], t)
         return len(targets)
 
     def undo(self):

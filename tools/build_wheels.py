@@ -2,8 +2,9 @@
 
     python tools/build_wheels.py <version> <libs dir> <out dir>
 
-<libs dir> holds win_x64/, linux_x64/ and macos_arm64/ with the patched
-networking library for each, plus build.json (obn_version, upstream, built).
+<libs dir> holds win_x64/, linux_x64/ and macos_arm64/, each with one folder
+per library series (02.08.04/, 02.08.01/) holding the patched networking
+library, plus build.json (obn_version, upstream, built).
 Each wheel gets the plugin code and only its own platform's library. A
 platform whose library is missing is skipped, so a failed build on one OS
 doesn't hold the others back.
@@ -60,17 +61,20 @@ def main(version, libs, out):
     os.makedirs(out, exist_ok=True)
     made = 0
     for plat, (lib, tag) in PLATFORMS.items():
-        lib_path = os.path.join(libs, plat, lib)
-        if not os.path.isfile(lib_path):
+        files = {
+            PKG + "/__init__.py": code,
+            PKG + "/" + PLUGIN: code,
+            PKG + "/bin/build.json": build_json,
+        }
+        series = sorted(d for d in os.listdir(os.path.join(libs, plat))
+                        if os.path.isfile(os.path.join(libs, plat, d, lib))) if os.path.isdir(os.path.join(libs, plat)) else []
+        if not series:
             print("skipping %s: no %s" % (plat, lib))
             continue
-        with open(lib_path, "rb") as fh:
-            files = {
-                PKG + "/__init__.py": code,
-                PKG + "/" + PLUGIN: code,
-                PKG + "/bin/build.json": build_json,
-                "%s/bin/%s/%s" % (PKG, plat, lib): fh.read(),
-            }
+        for abi in series:
+            with open(os.path.join(libs, plat, abi, lib), "rb") as fh:
+                files["%s/bin/%s/%s/%s" % (PKG, plat, abi, lib)] = fh.read()
+        print("%s: series %s" % (plat, ", ".join(series)))
         wheel(os.path.join(out, "%s_%s.whl" % (PKG, tag)), version, files)
         made += 1
     if not made:
