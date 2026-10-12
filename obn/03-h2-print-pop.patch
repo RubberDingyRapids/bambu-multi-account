@@ -1,108 +1,91 @@
-From e3c6395cd58b5c54aa113dc19ee2797d81e32405 Mon Sep 17 00:00:00 2001
-From: RubberDingyRapids <smellthellama@gmail.com>
-Date: Thu, 8 Oct 2026 22:29:06 +0100
-Subject: [PATCH] cloud: send PoP on /my/task by default (mytask_pop_disable to
- turn it off)
+From 7f74cff07bd1f2c1277b07a0822d2317bb55e56c Mon Sep 17 00:00:00 2001
+From: RubberDingyRapids <53348682+RubberDingyRapids@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 08:55:26 +0100
+Subject: [PATCH] cloud: send PoP on /my/task for every region
+ (mytask_pop_disable to opt out)
 
+Upstream's mytask_pop defaults to auto, which only attaches the PoP pair on the CN cloud. An H2S on api.bambulab.com 403s on /my/task without it and prints with it (2026-10-08), so this build attaches it on every region, still key-match guarded. mytask_pop is not consulted because the 0.2.27-0.2.30 templates wrote mytask_pop = 0 into every new obn.conf; mytask_pop_disable = 1 turns it off.
 ---
- include/obn/config.hpp     |  9 +++++++++
- src/cloud_print.cpp        |  9 +++++----
+ include/obn/config.hpp     |  8 ++++++++
+ src/cloud_print.cpp        |  9 ++++-----
  src/config.cpp             |  1 +
- tests/cloud_print_test.cpp | 18 ++++++++++++++++--
- 4 files changed, 31 insertions(+), 6 deletions(-)
+ tests/cloud_print_test.cpp | 28 +++++++++++++++++++---------
+ 4 files changed, 32 insertions(+), 14 deletions(-)
 
 diff --git a/include/obn/config.hpp b/include/obn/config.hpp
-index a896e36..94de412 100644
+index 5c50d82..fd21b08 100644
 --- a/include/obn/config.hpp
 +++ b/include/obn/config.hpp
-@@ -125,8 +125,17 @@ struct Settings {
-     // 10.05 lists /my/task as PoP-required on secured printers. add_pop_headers
-     // silently sends nothing when the slicer key/cert material is absent or
-     // mismatched, so 1 is safe on accounts without credentials.
-+    // bambu-multi-account build: no longer consulted, see mytask_pop_disable.
-     bool mytask_pop = false;
+@@ -143,6 +143,14 @@ struct Settings {
+     // the absent-key (or `mytask_pop = auto`) region-based default.
+     bool mytask_pop_set = false;
  
-+    // bambu-multi-account build: the PoP pair is sent on /my/task always
-+    // (still key-match guarded). An H2S on api.bambulab.com 403'd with
-+    // mytask_pop = 0 and printed with 1 (2026-10-08), so it is not a CN-only
-+    // need, and the 0.2.27 template writes `mytask_pop = 0` into every new
-+    // obn.conf, so the old flag can't tell a choice from a default. Set
-+    // mytask_pop_disable = 1 to leave the pair off.
++    // bambu-multi-account build: the PoP pair goes on /my/task for every
++    // region (still key-match guarded), whatever mytask_pop says. An H2S on
++    // api.bambulab.com 403'd without it and printed with it (2026-10-08), so
++    // it is not a CN-only need, and the 0.2.27-0.2.30 templates wrote
++    // `mytask_pop = 0` into every new obn.conf, so an explicit 0 cannot tell
++    // a choice from a default. Set mytask_pop_disable = 1 to leave it off.
 +    bool mytask_pop_disable = false;
 +
      // BambuSource logging — propagated to libBambuSource via obn.env
      std::string bambusource_log_level;
      std::string bambusource_log_stderr;
 diff --git a/src/cloud_print.cpp b/src/cloud_print.cpp
-index 77e69a4..8fa6bd3 100644
+index bd51d12..073fbb0 100644
 --- a/src/cloud_print.cpp
 +++ b/src/cloud_print.cpp
-@@ -731,17 +731,18 @@ std::string build_task_body(const BBL::PrintParams& p,
- // or flag on with unusable signing material).
- bool apply_mytask_pop(std::map<std::string, std::string>& hdrs)
+@@ -733,11 +733,10 @@ std::string build_task_body(const BBL::PrintParams& p,
+ bool apply_mytask_pop(std::map<std::string, std::string>& hdrs,
+                       const std::string& region)
  {
--    if (!obn::config::current().mytask_pop) {
--        OBN_DEBUG("cloud_print: mytask_pop=0; PoP headers omitted");
-+    // bambu-multi-account build: on unless mytask_pop_disable (see config.hpp).
+-    const auto& cfg = obn::config::current();
+-    const bool on = cfg.mytask_pop_set ? cfg.mytask_pop
+-                                       : obn::config::is_cn_region(region);
+-    if (!on) {
+-        OBN_DEBUG("cloud_print: mytask_pop off (region=%s); PoP headers omitted",
++    // bambu-multi-account build: on for every region unless
++    // mytask_pop_disable (see config.hpp); mytask_pop is not consulted.
 +    if (obn::config::current().mytask_pop_disable) {
-+        OBN_DEBUG("cloud_print: mytask_pop_disable=1; PoP headers omitted");
++        OBN_DEBUG("cloud_print: mytask_pop_disable=1 (region=%s); PoP headers omitted",
+                   region.c_str());
          return false;
      }
-     if (!obn::signing::add_pop_headers(hdrs)) {
--        OBN_WARN("cloud_print: mytask_pop=1 but PoP headers were not attached "
-+        OBN_WARN("cloud_print: PoP headers were not attached "
-                  "(slicer key/cert missing or mismatched; see obn.conf "
-                  "slicer_key_pem/slicer_cert_pem)");
-         return false;
-     }
--    OBN_DEBUG("cloud_print: mytask_pop=1 attached PoP cert_id='%s' "
-+    OBN_DEBUG("cloud_print: attached PoP cert_id='%s' "
-               "sec_sign_len=%zu",
-               hdrs["x-bbl-app-certification-id"].c_str(),
-               hdrs["x-bbl-device-security-sign"].size());
 diff --git a/src/config.cpp b/src/config.cpp
-index f69a2cd..a6b71a8 100644
+index c63a532..1f2df3d 100644
 --- a/src/config.cpp
 +++ b/src/config.cpp
-@@ -118,6 +118,7 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
-     else if (key == "client_name")                 out.client_name = (val == "OpenBambooNetworking") ? "BambuStudio" : val;  // pre-8e3dfb2 default: /my/task and /user/ttcode reject it with 403
-     else if (key == "executable_info")             out.executable_info = val;
-     else if (key == "mytask_pop")                  out.mytask_pop = truthy(val);
+@@ -134,6 +134,7 @@ void apply_key(Settings& out, const std::string& key, const std::string& val)
+         out.mytask_pop_set = explicit_val;
+         out.mytask_pop      = explicit_val ? truthy(val) : false;
+     }
 +    else if (key == "mytask_pop_disable")          out.mytask_pop_disable = truthy(val);
      else if (key == "bambusource_log_level")       out.bambusource_log_level = val;
      else if (key == "bambusource_log_stderr")     out.bambusource_log_stderr = val;
      else if (key == "bambusource_log_to_file")   out.bambusource_log_to_file = val;
 diff --git a/tests/cloud_print_test.cpp b/tests/cloud_print_test.cpp
-index 334142d..8e3187b 100644
+index f32fe17..b26d2fb 100644
 --- a/tests/cloud_print_test.cpp
 +++ b/tests/cloud_print_test.cpp
-@@ -911,6 +911,20 @@ static void test_mytask_pop_on_without_material_is_noop()
+@@ -879,8 +879,8 @@ static bool write_test_signing_material(const std::filesystem::path& dir)
  
- static void test_mytask_pop_on_with_material_attaches_pair()
+ static void test_mytask_pop_default_global_off()
  {
-+    // bambu-multi-account build: mytask_pop = 0 (the 0.2.27 template value)
-+    // must not switch it off; only mytask_pop_disable does.
-+    {
-+        const auto d0 = std::filesystem::temp_directory_path() / "obn-mytask-pop-zero";
-+        std::filesystem::remove_all(d0);
-+        std::filesystem::create_directories(d0);
-+        CHECK(write_test_signing_material(d0));
-+        { std::ofstream out(d0 / "obn.conf"); out << "mytask_pop = 0\n"; }
-+        obn::config::load_or_create(d0.string());
-+        obn::signing::invalidate_cache();
-+        std::map<std::string, std::string> h0;
-+        CHECK(obn::cloud_print::test_apply_mytask_pop(h0));
-+        std::filesystem::remove_all(d0);
-+    }
-     const auto dir = std::filesystem::temp_directory_path()
-                      / "obn-mytask-pop-material";
-     std::filesystem::remove_all(dir);
-@@ -937,10 +951,10 @@ static void test_mytask_pop_on_with_material_attaches_pair()
+-    // Default Settings (no obn.conf loaded yet): auto means the historical
+-    // bearer-only request outside CN.
++    // Default Settings (no obn.conf loaded yet): on, but there is no signing
++    // material, so nothing is attached (bambu-multi-account build).
+     std::map<std::string, std::string> hdrs;
+     hdrs["X-BBL-Client-Name"] = "BambuStudio";
+     CHECK(!obn::cloud_print::test_apply_mytask_pop(hdrs, "GLOBAL"));
+@@ -942,11 +942,11 @@ static void test_mytask_pop_on_with_material_attaches_pair()
      // PoP must not clobber the client identity headers.
      CHECK(hdrs.at("X-BBL-Client-Name") == "BambuStudio");
  
--    // Drop back to the default: the next call omits the pair again.
-+    // Switched off: the next call omits the pair again.
+-    // Explicit 0 forces the pair off even on the CN cloud, where the
+-    // region-based default would attach it.
++    // mytask_pop_disable = 1 forces the pair off, even on the CN cloud
++    // (bambu-multi-account build).
      {
          std::ofstream out(dir / "obn.conf");
 -        out << "mytask_pop = 0\n";
@@ -110,6 +93,44 @@ index 334142d..8e3187b 100644
      }
      obn::config::load_or_create(dir.string());
      std::map<std::string, std::string> off;
+@@ -959,7 +959,8 @@ static void test_mytask_pop_on_with_material_attaches_pair()
+ 
+ static void test_mytask_pop_auto_follows_region()
+ {
+-    // Default (key absent): the pair attaches on CN and stays off elsewhere.
++    // bambu-multi-account build: auto and the legacy template value
++    // mytask_pop = 0 both attach the pair on every region.
+     const auto dir = std::filesystem::temp_directory_path()
+                      / "obn-mytask-pop-auto";
+     std::filesystem::remove_all(dir);
+@@ -973,15 +974,24 @@ static void test_mytask_pop_auto_follows_region()
+     obn::signing::invalidate_cache();
+ 
+     std::map<std::string, std::string> global;
+-    CHECK(!obn::cloud_print::test_apply_mytask_pop(global, "GLOBAL"));
+-    CHECK(global.count("x-bbl-app-certification-id") == 0);
+-    CHECK(global.count("x-bbl-device-security-sign") == 0);
++    CHECK(obn::cloud_print::test_apply_mytask_pop(global, "GLOBAL"));
++    CHECK(global.count("x-bbl-app-certification-id") == 1);
++    CHECK(global.count("x-bbl-device-security-sign") == 1);
+ 
+     std::map<std::string, std::string> cn;
+     CHECK(obn::cloud_print::test_apply_mytask_pop(cn, "CN"));
+     CHECK(cn.count("x-bbl-app-certification-id") == 1);
+     CHECK(cn.count("x-bbl-device-security-sign") == 1);
+ 
++    {
++        std::ofstream out(dir / "obn.conf");
++        out << "mytask_pop = 0\n";
++    }
++    obn::config::load_or_create(dir.string());
++    std::map<std::string, std::string> legacy;
++    CHECK(obn::cloud_print::test_apply_mytask_pop(legacy, "GLOBAL"));
++    CHECK(legacy.count("x-bbl-app-certification-id") == 1);
++
+     std::filesystem::remove_all(dir);
+ }
+ 
 -- 
-2.52.0.windows.1
+2.55.0.windows.3
 
