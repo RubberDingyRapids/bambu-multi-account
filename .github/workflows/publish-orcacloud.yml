@@ -74,7 +74,9 @@ jobs:
           )
           [ -n "$obn_version" ] || { echo "couldnt match upstream to an obn plugin release" >&2; exit 1; }
 
-          key="$upstream-$(cat bambu_multi_account_any.py obn/*.patch | sha256sum | cut -c1-12)"
+          # the obn plugin version is part of the key: persano can re-release the plugin from the same
+          # library commit (0.2.32 -> 0.2.33 did), and the installer refuses a build whose label is older
+          key="$upstream-$obn_version-$(cat bambu_multi_account_any.py obn/*.patch | sha256sum | cut -c1-12)"
 
           last_tag="$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')"
           last_key=""
