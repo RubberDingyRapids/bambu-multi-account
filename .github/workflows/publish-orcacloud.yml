@@ -41,6 +41,7 @@ jobs:
       build: ${{ steps.plan.outputs.build }}
       upstream: ${{ steps.plan.outputs.upstream }}
       obn_version: ${{ steps.plan.outputs.obn_version }}
+      lib_release: ${{ steps.plan.outputs.lib_release }}
       version: ${{ steps.plan.outputs.version }}
       key: ${{ steps.plan.outputs.key }}
     steps:
@@ -59,9 +60,20 @@ jobs:
 
           # which open bambu networking plugin release is this commit (or the newest one it contains)
           curl -sSL "https://raw.githubusercontent.com/$OBN_PLUGIN/HEAD/CHANGELOG.md" -o obn_changelog.md
-          obn_version=""
+          # Which obn plugin release bundles the library we build from? persano's library embeds its
+          # git commit, so look for our upstream's short sha inside the dll in his latest wheel: a hit
+          # means his newest release bundles exactly this library (installer-only releases included).
+          # Otherwise fall back to the changelog, which names the library commit for releases that
+          # changed it: the newest such entry contained in our upstream is the library's release.
+          obn_version=""; lib_release=""
+          newest_plugin="$(curl -sSL "https://raw.githubusercontent.com/$OBN_PLUGIN/HEAD/open_bambu_networking.py" | sed -n 's/^# version = "\(.*\)"$/\1/p' | head -1)"
+          curl -sSL -o obn_latest.whl "https://github.com/$OBN_PLUGIN/raw/HEAD/open_bambu_networking_win_x86_64.whl" || true
+          dll_in_whl="$(unzip -Z1 obn_latest.whl 2>/dev/null | grep -E 'win_x64/bambu_networking.dll$' | head -1 || true)"
+          if [ -n "$newest_plugin" ] && [ -n "$dll_in_whl" ] && unzip -p obn_latest.whl "$dll_in_whl" | grep -a -q "${upstream:0:7}"; then
+            obn_version="$newest_plugin"
+          fi
           while read -r ver sha; do
-            if git -C upstream merge-base --is-ancestor "$sha" "$upstream" 2>/dev/null; then obn_version="$ver"; break; fi
+            if git -C upstream merge-base --is-ancestor "$sha" "$upstream" 2>/dev/null; then lib_release="$ver"; break; fi
           done < <(python3 - <<'EOF'
           import re
           text = open("obn_changelog.md", encoding="utf-8").read()
@@ -72,7 +84,10 @@ jobs:
                   print(ver, m.group(1))
           EOF
           )
+          [ -n "$obn_version" ] || obn_version="$lib_release"
+          [ -n "$lib_release" ] || lib_release="$obn_version"
           [ -n "$obn_version" ] || { echo "couldnt match upstream to an obn plugin release" >&2; exit 1; }
+          echo "library commit ${upstream:0:7}: released in obn $lib_release, bundled by obn $obn_version"
 
           # the obn plugin version is part of the key: persano can re-release the plugin from the same
           # library commit (0.2.32 -> 0.2.33 did), and the installer refuses a build whose label is older
@@ -80,7 +95,7 @@ jobs:
 
           last_tag="$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""')"
           last_key=""
-          [ -n "$last_tag" ] && last_key="$(gh release view "$last_tag" --json body --jq .body | sed -n 's/.*build-key: \([0-9a-f-]*\).*/\1/p' | head -1)"
+          [ -n "$last_tag" ] && last_key="$(gh release view "$last_tag" --json body --jq .body | sed -n 's/.*build-key: \([0-9a-f.-]*\).*/\1/p' | head -1)"
 
           build=true
           if [ "$key" = "$last_key" ] && [ "${{ inputs.force }}" != "true" ]; then build=false; fi
@@ -96,7 +111,7 @@ jobs:
           )"
           echo "upstream=$upstream obn=$obn_version key=$key last=$last_key build=$build version=$version"
           {
-            echo "build=$build"; echo "upstream=$upstream"; echo "obn_version=$obn_version"
+            echo "build=$build"; echo "upstream=$upstream"; echo "obn_version=$obn_version"; echo "lib_release=$lib_release"
             echo "version=$version"; echo "key=$key"
           } >> "$GITHUB_OUTPUT"
 
@@ -227,7 +242,8 @@ jobs:
           up="${{ needs.check.outputs.upstream }}"
           missing=""
           for p in win_x86_64 linux_x86_64 macosx_arm64; do [ -f "dist/bambu_multi_account_$p.whl" ] || missing="$missing $p"; done
-          notes="multi account build for open bambu networking ${{ needs.check.outputs.obn_version }} (persanos \`${up:0:7}\`)"
+          lib="${{ needs.check.outputs.lib_release }}"; obn="${{ needs.check.outputs.obn_version }}"
+          notes="multi account build for open bambu networking $obn (library \`${up:0:7}\`$([ "$lib" != "$obn" ] && echo ", unchanged since $lib"))"
           [ -n "$missing" ] && notes="$notes. build failed for:$missing so theres no wheel for those this time"
           notes="$notes
 
