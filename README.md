@@ -56,7 +56,9 @@ bambu networking, so it never rolls back one of his fixes. the builds come
 from github actions in [bambu-multi-account](https://github.com/RubberDingyRapids/bambu-multi-account),
 which checks his repo every day and makes a new build when he changes
 something. if he updates and the build hasnt caught up yet, the tab tells
-you and waits.
+you and waits. if you need multi account right now theres an "install
+anyway" button (click it twice), it puts the older build in and you lose
+whatever his newer version fixed until the new build lands.
 
 if you hit install/update in his open bambu tab, his library goes back in
 and multi account switches off. just open this tab and install again.

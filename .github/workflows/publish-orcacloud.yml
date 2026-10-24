@@ -243,8 +243,11 @@ jobs:
           missing=""
           for p in win_x86_64 linux_x86_64 macosx_arm64; do [ -f "dist/bambu_multi_account_$p.whl" ] || missing="$missing $p"; done
           lib="${{ needs.check.outputs.lib_release }}"; obn="${{ needs.check.outputs.obn_version }}"
-          notes="multi account build for open bambu networking $obn (library \`${up:0:7}\`$([ "$lib" != "$obn" ] && echo ", unchanged since $lib"))"
-          [ -n "$missing" ] && notes="$notes. build failed for:$missing so theres no wheel for those this time"
+          # plain ifs: a `[ ] && ...` that comes out false would end the step under set -e
+          since=""
+          if [ "$lib" != "$obn" ]; then since=", unchanged since $lib"; fi
+          notes="multi account build for open bambu networking $obn (library \`${up:0:7}\`$since)"
+          if [ -n "$missing" ]; then notes="$notes. build failed for:$missing so theres no wheel for those this time"; fi
           notes="$notes
 
           build-key: ${{ needs.check.outputs.key }}"

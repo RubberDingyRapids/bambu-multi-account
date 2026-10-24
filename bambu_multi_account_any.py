@@ -988,7 +988,7 @@ function render(){
   var L = st.library||{};
   if(L.state==='can_install') b+='<div class="banner info"><b>Turn on multi account</b><br>The Open Bambu Networking library you have doesnt run more than one account. This plugin comes with one that does: OBN '+esc(L.bundle_obn||'?')+' plus multi account. Your current one gets backed up so you can go back.<div class="row" style="margin-top:8px"><button class="primary" data-lib="install_library">Install multi account library</button><span class="muted small">needs an OrcaSlicer restart</span></div></div>';
   else if(L.state==='restart') b+='<div class="banner info">Multi account library is in. Restart OrcaSlicer to start using it.'+(L.can_undo?' <button data-lib="undo_library">Put the original back</button>':'')+'</div>';
-  else if(L.state==='outdated') b+='<div class="banner">Your Open Bambu Networking is '+esc(L.obn_version)+' but the multi account build in this plugin is for '+esc(L.bundle_obn)+'. A new build normally lands within a day, update this plugin then. Installing the old one would undo the newer fixes, so its not offered.</div>';
+  else if(L.state==='outdated') b+='<div class="banner">Your Open Bambu Networking is '+esc(L.obn_version)+' but the multi account build in this plugin is for '+esc(L.bundle_obn)+'. A new build normally lands within a day, update this plugin then. You can install the older one now if you need multi account straight away, but it undoes whatever '+esc(L.obn_version)+' fixed until the new build comes.<div class="row" style="margin-top:8px">'+(S.anyway?'<button class="primary" data-lib-anyway="install_library" data-confirm="1">Click again: install the older '+esc(L.bundle_obn)+' build</button>':'<button data-lib-anyway="install_library">Install anyway</button>')+'<span class="muted small">needs an OrcaSlicer restart</span></div></div>';
   else if(L.state==='no_obn') b+='<div class="banner">Open Bambu Networking isnt installed. Subscribe to it on the plugin hub, install it from its tab, restart and log in to Bambu, then come back here.</div>';
   else if(!st.live && st.bridge_error) b+='<div class="banner">'+esc(st.bridge_error)+'</div>';
   if(st.restart_needed) b+='<div class="banner">Restart OrcaSlicer to finish switching the main account.</div>';
@@ -1041,6 +1041,11 @@ document.addEventListener('change', function(ev){
 document.addEventListener('click', function(ev){
   var t=ev.target;
   if(t.dataset && t.dataset.lib){ ev.preventDefault(); send({action:t.dataset.lib}); return; }
+  if(t.dataset && t.dataset.libAnyway){
+    if(t.dataset.confirm){ S.anyway=false; send({action:t.dataset.libAnyway}); }
+    else { S.anyway=true; render(); }
+    return;
+  }
   if(t.dataset.rm){ if(t.dataset.confirm){ send({action:'remove', user_id:t.dataset.rm}); } else { t.dataset.confirm='1'; t.textContent='Click again to remove'; } }
   else if(t.dataset.main){ if(t.dataset.confirm){ send({action:'make_primary', user_id:t.dataset.main}); } else { t.dataset.confirm='1'; t.textContent='Click again: swap and restart later'; } }
 });
