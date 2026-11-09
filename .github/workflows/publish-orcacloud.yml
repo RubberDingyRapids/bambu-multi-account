@@ -67,8 +67,13 @@ jobs:
           # changed it: the newest such entry contained in our upstream is the library's release.
           obn_version=""; lib_release=""
           newest_plugin="$(curl -sSL "https://raw.githubusercontent.com/$OBN_PLUGIN/HEAD/open_bambu_networking.py" | sed -n 's/^# version = "\(.*\)"$/\1/p' | head -1)"
-          curl -sSL -o obn_latest.whl "https://github.com/$OBN_PLUGIN/raw/HEAD/open_bambu_networking_win_x86_64.whl" || true
+          # persano moved the wheels into dist/ (2026-11-03); try there first, then the old root path
+          for whl in dist/open_bambu_networking_win_x86_64.whl open_bambu_networking_win_x86_64.whl; do
+            rm -f obn_latest.whl
+            curl -fsSL -o obn_latest.whl "https://github.com/$OBN_PLUGIN/raw/HEAD/$whl" && break || true
+          done
           dll_in_whl="$(unzip -Z1 obn_latest.whl 2>/dev/null | grep -E 'win_x64/bambu_networking.dll$' | head -1 || true)"
+          [ -n "$dll_in_whl" ] || echo "::warning::could not read the dll in persano's latest wheel; falling back to the changelog"
           if [ -n "$newest_plugin" ] && [ -n "$dll_in_whl" ] && unzip -p obn_latest.whl "$dll_in_whl" | grep -a -q "${upstream:0:7}"; then
             obn_version="$newest_plugin"
           fi
