@@ -45,6 +45,7 @@ import re
 import shutil
 import ssl
 import sys
+import threading
 import time
 
 try:
@@ -58,6 +59,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ACCOUNTS_FILE = "obn.accounts.json"
 AUTH_FILE = "obn.auth.json"
 HTTP_TIMEOUT_S = 20
+# The page asks for its state every 4 s from OrcaSlicer's UI thread. The networking
+# library's status call takes its main lock, which its own threads can hold for a second
+# or more, so a worker reads it on this interval and the page gets the last answer.
+STATUS_POLL_S = 4
+STATUS_FIRST_WAIT_S = 0.25      # the very first page state waits this long for a reading
+STATUS_SYNC_FALLBACK_S = 60     # with no worker thread allowed, read it on the UI thread this rarely
 # Bambu tokens last months; refresh well before the end so a long weekend
 # with OrcaSlicer closed never strands an account.
 REFRESH_MARGIN_S = 14 * 24 * 3600
@@ -451,12 +458,27 @@ def version_tuple(v):
     return tuple(int(x) for x in re.findall(r"\d+", str(v or ""))[:4]) or (0,)
 
 
+_SHA_CACHE = {}
+
+
 def file_sha256(path):
+    """SHA-256 of a file, remembered until its size or modification time changes.
+
+    The page state compares every networking library copy (about 8 MB each, five or more of
+    them) with the bundled builds every few seconds; hashing them all each time on the UI
+    thread is wasted work. Our own copies use shutil.copyfile, which stamps a new mtime."""
+    st = os.stat(path)
+    key = (st.st_size, st.st_mtime_ns)
+    hit = _SHA_CACHE.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
     h = hashlib.sha256()
     with open(path, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
-    return h.hexdigest()
+    digest = h.hexdigest()
+    _SHA_CACHE[path] = (key, digest)
+    return digest
 
 
 def obn_plugin_version(base_dir):
@@ -576,6 +598,7 @@ class LibraryInstaller:
 
     def _place(self, src, dst):
         """Copy src over dst, moving a locked (loaded) dst aside first."""
+        _SHA_CACHE.pop(dst, None)
         try:
             shutil.copyfile(src, dst)
             return
@@ -638,6 +661,14 @@ class MultiAccountCore:
         self.printers = {}            # user_id -> [printer] from the last fetch
         self.notice = ""
         self.restart_needed = False
+        self._status = {}
+        self._status_lock = threading.Lock()
+        self._status_ready = threading.Event()
+        self._status_wake = threading.Event()
+        self._status_thread = None
+        self._status_stop = False
+        self._status_sync_at = None
+        self._status_thread_error = ""
 
     def _region(self):
         return self.store.primary().get("region") or "GLOBAL"
@@ -650,7 +681,73 @@ class MultiAccountCore:
         n = self.bridge.reload()
         if n is not None and n < 0:
             _log("reload returned %d" % n)
+        self._status_wake.set()
         return n
+
+    # -- live connection state, read off the UI thread ------------------------------------
+    def live_status(self):
+        """The networking library's last account status, without waiting on it.
+
+        obn_extra_accounts_status() takes the networking agent's main lock. The page polls
+        its state every 4 s on OrcaSlicer's UI thread, and calling it there froze the whole
+        app for 1-2 s each time (layer scrolling in Preview included). A worker thread reads
+        it instead; ctypes drops the GIL during the call, so a wait there blocks nothing."""
+        if not self.bridge.live:
+            return {}
+        if self._start_status_worker():
+            if not self._status_ready.is_set():
+                self._status_ready.wait(STATUS_FIRST_WAIT_S)
+        else:
+            now = time.monotonic()
+            if self._status_sync_at is None or now - self._status_sync_at >= STATUS_SYNC_FALLBACK_S:
+                self._status_sync_at = now
+                self._read_status()
+        with self._status_lock:
+            return self._status
+
+    def _read_status(self):
+        try:
+            st = self.bridge.status() if self.bridge.live else {}
+        except Exception as e:  # noqa: BLE001
+            _log("status: %r" % e)
+            st = None
+        if isinstance(st, dict):
+            with self._status_lock:
+                self._status = st
+        self._status_ready.set()
+
+    def _start_status_worker(self):
+        """Start the status thread if it isn't running. False when threads aren't allowed:
+        OrcaSlicer's audit hook refuses one started before its prompt can show (e.g. right
+        after a hub update), so this is retried from every page message."""
+        t = self._status_thread
+        if t is not None and t.is_alive():
+            return True
+        if self._status_stop:
+            return False
+        try:
+            t = threading.Thread(target=self._status_loop, name="multi-account-status", daemon=True)
+            t.start()
+        except Exception as e:  # noqa: BLE001
+            msg = "%s: %s" % (type(e).__name__, e)
+            if msg != self._status_thread_error:
+                self._status_thread_error = msg
+                _log("status thread not started (%s); reading it on the UI thread every %d s instead"
+                     % (msg, STATUS_SYNC_FALLBACK_S))
+            return False
+        self._status_thread = t
+        self._status_thread_error = ""
+        return True
+
+    def _status_loop(self):
+        while not self._status_stop:
+            self._read_status()
+            self._status_wake.wait(STATUS_POLL_S)
+            self._status_wake.clear()
+
+    def stop(self):
+        self._status_stop = True
+        self._status_wake.set()
 
     # -- token upkeep -------------------------------------------------------------
     def refresh_tokens(self, force=False, now=None):
@@ -783,7 +880,7 @@ class MultiAccountCore:
     # -- page state -------------------------------------------------------------------
     def page_state(self):
         primary = self.store.primary()
-        status = self.bridge.status() if self.bridge.live else {}
+        status = self.live_status()
         live = {str(a.get("user_id")): a for a in (status.get("accounts") or [])}
         rows = []
         for rec in self.store.accounts:
@@ -1152,6 +1249,10 @@ if orca is not None:
                 self._core().startup()
             except Exception as e:  # noqa: BLE001
                 _log("on_load: %r" % e)
+
+        def on_unload(self):
+            if self.core:
+                self.core.stop()
 
         def get_ui(self):
             self._core()

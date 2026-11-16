@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import glob as _glob
@@ -93,6 +94,7 @@ class Base(unittest.TestCase):
         self.core = ma.MultiAccountCore(base_dir=self.dir, api_factory=FakeApi, bridge=self.bridge)
 
     def tearDown(self):
+        self.core.stop()
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def accounts_file(self):
@@ -193,11 +195,46 @@ class EditTests(Base):
         self.assertEqual(extras[0]["access_token"], "tok-home")
         self.assertTrue(r["state"]["restart_needed"])
 
+    def test_slow_status_does_not_block_page_state(self):
+        # The library's status call can wait on its lock; page_state must not wait with it.
+        self.core.page_state()                  # first reading
+        slow = threading.Event()
+        def blocking_status():
+            slow.wait(3)
+            return {"api": 1, "accounts": []}
+        self.bridge.status = blocking_status
+        self.core._status_wake.set()            # make the worker call the slow one now
+        time.sleep(0.05)
+        t = time.monotonic()
+        for _ in range(5):
+            self.core.page_state()
+        self.assertLess(time.monotonic() - t, 0.5)
+        slow.set()
+        self.core.stop()
+
+    def test_status_without_threads_is_read_rarely(self):
+        calls = []
+        def counted():
+            calls.append(1)
+            return {"api": 1, "accounts": []}
+        self.bridge.status = counted
+        self.core._start_status_worker = lambda: False
+        for _ in range(5):
+            self.core.page_state()
+        self.assertEqual(len(calls), 1)
+
     def test_status_merges_live_state(self):
         self.bridge.status_doc = {"api": 1, "accounts": [
             {"user_id": "200", "connected": True, "started": True}]}
-        st = self.core.page_state()
-        row = st["accounts"][0]
+        # The page shows the worker's latest reading; nudge it and wait for the new one.
+        self.core._status_wake.set()
+        deadline = time.monotonic() + 2
+        while True:
+            st = self.core.page_state()
+            row = st["accounts"][0]
+            if row["connected"] or time.monotonic() > deadline:
+                break
+            time.sleep(0.02)
         self.assertTrue(st["live"])
         self.assertTrue(row["connected"])
         self.assertEqual(row["printers"][0]["dev_id"], "W1")
@@ -290,6 +327,27 @@ class HelperTests(unittest.TestCase):
             self.assertTrue(b.error)
             self.assertIsNone(b.reload())
             self.assertEqual(b.status(), {})
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class HashCacheTests(unittest.TestCase):
+    def test_hash_is_reused_until_the_file_changes(self):
+        d = tempfile.mkdtemp(prefix="ma_hash_")
+        try:
+            p = os.path.join(d, "lib.dll")
+            with open(p, "wb") as fh:
+                fh.write(b"A" * 1000)
+            first = ma.file_sha256(p)
+            st = os.stat(p)
+            # same size and mtime: the cached hash comes back without reading the file
+            with open(p, "wb") as fh:
+                fh.write(b"B" * 1000)
+            os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+            self.assertEqual(ma.file_sha256(p), first)
+            # a new mtime is noticed
+            os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+            self.assertNotEqual(ma.file_sha256(p), first)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
