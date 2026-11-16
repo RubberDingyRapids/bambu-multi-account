@@ -662,6 +662,7 @@ class MultiAccountCore:
         self.notice = ""
         self.restart_needed = False
         self._status = {}
+        self._library = None          # installer state from the worker; None until its first pass
         self._status_lock = threading.Lock()
         self._status_ready = threading.Event()
         self._status_wake = threading.Event()
@@ -692,8 +693,24 @@ class MultiAccountCore:
         its state every 4 s on OrcaSlicer's UI thread, and calling it there froze the whole
         app for 1-2 s each time (layer scrolling in Preview included). A worker thread reads
         it instead; ctypes drops the GIL during the call, so a wait there blocks nothing."""
+        self._refresh_cache()
         if not self.bridge.live:
             return {}
+        with self._status_lock:
+            return self._status
+
+    def cached_library_state(self):
+        """The installer's state as the worker last saw it. Working it out touches a dozen
+        files, and every file access of a plugin goes through OrcaSlicer's audit hook on the
+        UI thread, so the page's 4 s poll must not do it there either."""
+        self._refresh_cache()
+        with self._status_lock:
+            lib = self._library
+        if lib is None:                 # the worker hasn't finished its first pass yet
+            lib = self._read_library()
+        return lib
+
+    def _refresh_cache(self):
         if self._start_status_worker():
             if not self._status_ready.is_set():
                 self._status_ready.wait(STATUS_FIRST_WAIT_S)
@@ -701,9 +718,12 @@ class MultiAccountCore:
             now = time.monotonic()
             if self._status_sync_at is None or now - self._status_sync_at >= STATUS_SYNC_FALLBACK_S:
                 self._status_sync_at = now
-                self._read_status()
-        with self._status_lock:
-            return self._status
+                self._poll_once()
+
+    def _poll_once(self):
+        self._read_status()
+        self._read_library()
+        self._status_ready.set()
 
     def _read_status(self):
         try:
@@ -714,7 +734,12 @@ class MultiAccountCore:
         if isinstance(st, dict):
             with self._status_lock:
                 self._status = st
-        self._status_ready.set()
+
+    def _read_library(self):
+        lib = self.library_state()
+        with self._status_lock:
+            self._library = lib
+        return lib
 
     def _start_status_worker(self):
         """Start the status thread if it isn't running. False when threads aren't allowed:
@@ -741,7 +766,7 @@ class MultiAccountCore:
 
     def _status_loop(self):
         while not self._status_stop:
-            self._read_status()
+            self._poll_once()
             self._status_wake.wait(STATUS_POLL_S)
             self._status_wake.clear()
 
@@ -912,7 +937,7 @@ class MultiAccountCore:
             "pending_email": (self.pending_login or {}).get("email", ""),
             "restart_needed": self.restart_needed,
             "notice": self.notice,
-            "library": self.library_state(),
+            "library": self.cached_library_state(),
         }
 
     def library_state(self):
@@ -966,9 +991,11 @@ class MultiAccountCore:
                 reply["message"] = self.make_primary(data.get("user_id"))
             elif action == "install_library":
                 n = self.installer.install()
+                self._read_library()
                 reply["message"] = "Multi account library in place (%d file%s). Restart OrcaSlicer to use it." % (n, "" if n == 1 else "s")
             elif action == "undo_library":
                 n = self.installer.undo()
+                self._read_library()
                 reply["message"] = "Original library put back (%d file%s). Restart OrcaSlicer." % (n, "" if n == 1 else "s")
             elif action == "refresh":
                 self.store.load()

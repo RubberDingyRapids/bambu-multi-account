@@ -223,6 +223,20 @@ class EditTests(Base):
             self.core.page_state()
         self.assertEqual(len(calls), 1)
 
+    def test_state_poll_touches_no_files(self):
+        # Every file access goes through OrcaSlicer's audit hook on the UI thread; once the
+        # worker has a reading, the page's 4 s poll must not touch the library files at all.
+        self.core.page_state()
+        def boom(*a, **k):
+            raise AssertionError("installer read on the UI thread")
+        self.core._status_stop = True             # freeze the worker's cache
+        self.core._status_wake.set()
+        self.core._status_thread.join(2)
+        self.core._start_status_worker = lambda: True
+        self.core.library_state = boom
+        for _ in range(3):
+            self.core.handle({"action": "state"})
+
     def test_status_merges_live_state(self):
         self.bridge.status_doc = {"api": 1, "accounts": [
             {"user_id": "200", "connected": True, "started": True}]}
